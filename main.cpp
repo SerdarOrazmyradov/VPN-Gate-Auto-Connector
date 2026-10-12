@@ -39,7 +39,7 @@ static std::mutex               g_attemptMutex;
 static std::atomic<int>         g_failedPasses{ 0 };
 static std::mutex               g_logMutex;
 
-static const wchar_t* kCsvUrl = L"https://disaster-2ad1.firebaseapp.com/vpngate.csv";
+static const wchar_t* kCsvUrl = L"https://disaster-2ad1a.firebaseapp.com/vpngate.csv";
 static const wchar_t* kVpnCmdPath = L"C:\\Program Files\\SoftEther VPN Client\\vpncmd.exe";
 static const wchar_t* kAccountName = L"vpngate_auto";
 
