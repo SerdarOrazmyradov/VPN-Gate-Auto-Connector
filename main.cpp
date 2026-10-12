@@ -1,165 +1,326 @@
-// ============================================================================
-//  VPN Gate auto-connector for SoftEther VPN Client
-//  - Win32 only, no GUI, no console window, no keystroke injection
-//  - Runs as a resident background process (Task Scheduler, logon, highest priv)
-//  - Ctrl+Alt+S hotkey, tray balloon on total failure, rolling log file
-// ============================================================================
-
+// main.cpp
+// VPN Gate background agent using SoftEther vpncmd.exe
+// Build: cl /std:c++17 /W4 /EHsc /MT /DUNICODE /D_UNICODE main.cpp
+#ifndef UNICODE
+#define UNICODE
+#endif
+#ifndef _UNICODE
+#define _UNICODE
+#endif
 #define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
 
 #include <windows.h>
-#include <winhttp.h>
 #include <shellapi.h>
+#include <wininet.h>
 
 #include <string>
 #include <vector>
-#include <atomic>
-#include <mutex>
-#include <cstdio>
-#include <cstdlib>
+#include <fstream>
 #include <sstream>
+#include <chrono>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <cwctype>
+#include <cwchar>
 
-#pragma comment(lib, "winhttp.lib")
+#pragma comment(lib, "wininet.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "user32.lib")
+#pragma comment(lib, "advapi32.lib")
 
 // ---------------------------------------------------------------------------
-//  Configuration
+// Globals
 // ---------------------------------------------------------------------------
-static const std::wstring kCsvUrl  = L"https://disaster-2ad1a.firebaseapp.com/vpngate.csv";
-static const std::wstring kVpnCmd  = L"C:\\Program Files\\SoftEther VPN Client\\vpncmd.exe";
-static const std::wstring kAccount = L"vpngate_auto";
-static const std::wstring kHub     = L"VPNGATE";
-static const std::wstring kUser    = L"vpn";
-static const std::wstring kPass    = L"vpn";
-static const std::wstring kNic     = L"VPN";
+static HWND                     g_msgWnd = nullptr;
+static HANDLE                   g_wakeEvent = nullptr;
+static std::atomic<bool>        g_stop{ false };
+static std::mutex               g_attemptMutex;
+static std::atomic<int>         g_failedPasses{ 0 };
+static std::mutex               g_logMutex;
 
-static const DWORD kCsvMaxAgeMin   = 45;      // cache lifetime
-static const DWORD kConnectTimeout = 20000;   // vpncmd AccountConnect
-static const DWORD kVerifyTimeout  = 8000;    // status poll after connect
-static const DWORD kAttemptTimeout = 28000;   // whole attempt bound
-static const DWORD kRetryWaitMs    = 10 * 60 * 1000;  // silent retry after failure
+static const wchar_t* kCsvUrl = L"https://disaster-2ad1.firebaseapp.com/vpngate.csv";
+static const wchar_t* kVpnCmdPath = L"C:\\Program Files\\SoftEther VPN Client\\vpncmd.exe";
+static const wchar_t* kAccountName = L"vpngate_auto";
 
-// ---------------------------------------------------------------------------
-//  Globals
-// ---------------------------------------------------------------------------
-static std::wstring      g_dir;
-static HWND              g_hwnd    = NULL;
-static HANDLE            g_wake    = NULL;   // auto-reset: "something happened"
-static std::atomic<bool> g_stop(false);
-static std::atomic<bool> g_hotkey(false);
-static std::mutex        g_logMx;
+static void OnHotkey();
+static LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
 
 // ---------------------------------------------------------------------------
-//  Small helpers
+// String helpers
 // ---------------------------------------------------------------------------
-static std::string WideToUtf8(const std::wstring& w)
-{
-    if (w.empty()) return std::string();
-    int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), NULL, 0, NULL, NULL);
-    std::string s(n, 0);
-    if (n) WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), &s[0], n, NULL, NULL);
+static std::string ToUtf8(const std::wstring& w) {
+    if (w.empty()) return {};
+    int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+    if (n <= 0) return {};
+    std::string s((size_t)n, 0);
+    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), s.data(), n, nullptr, nullptr);
     return s;
 }
 
-static std::wstring Utf8ToWide(const std::string& s)
-{
-    if (s.empty()) return std::wstring();
-    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), NULL, 0);
-    std::wstring w(n, 0);
-    if (n) MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], n);
+static std::wstring FromUtf8(const std::string& s) {
+    if (s.empty()) return {};
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
+    if (n <= 0) return {};
+    std::wstring w((size_t)n, 0);
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), w.data(), n);
     return w;
 }
 
-static std::wstring TimeStamp()
-{
+static std::wstring FromAcp(const std::string& s) {
+    if (s.empty()) return {};
+    int n = MultiByteToWideChar(CP_ACP, 0, s.c_str(), (int)s.size(), nullptr, 0);
+    if (n <= 0) return {};
+    std::wstring w((size_t)n, 0);
+    MultiByteToWideChar(CP_ACP, 0, s.c_str(), (int)s.size(), w.data(), n);
+    return w;
+}
+
+static int ParseIntSimple(const std::string& s) {
+    int v = 0;
+    for (char c : s) {
+        if (c < '0' || c > '9') break;
+        v = v * 10 + (c - '0');
+        if (v > 1000000) break;
+    }
+    return v;
+}
+
+// ---------------------------------------------------------------------------
+// Paths
+// ---------------------------------------------------------------------------
+static std::wstring GetExeDir() {
+    wchar_t buf[MAX_PATH];
+    DWORD n = GetModuleFileNameW(nullptr, buf, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return L".";
+    std::wstring p(buf, n);
+    size_t pos = p.find_last_of(L"\\/");
+    return (pos == std::wstring::npos) ? L"." : p.substr(0, pos);
+}
+
+static std::wstring LogPath()   { return GetExeDir() + L"\\vpnagent.log"; }
+static std::wstring StatePath() { return GetExeDir() + L"\\state.txt"; }
+static std::wstring CsvPath()   { return GetExeDir() + L"\\vpngate.csv"; }
+
+// ---------------------------------------------------------------------------
+// Logging
+// ---------------------------------------------------------------------------
+static void RotateLogIfNeeded(const std::wstring& path) {
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad)) return;
+    ULARGE_INTEGER sz;
+    sz.LowPart = fad.nFileSizeLow;
+    sz.HighPart = fad.nFileSizeHigh;
+    if (sz.QuadPart > 256ULL * 1024ULL) {
+        std::wstring oldp = path + L".old";
+        DeleteFileW(oldp.c_str());
+        MoveFileW(path.c_str(), oldp.c_str());
+    }
+}
+
+static void Log(const wchar_t* level, const std::wstring& msg) {
+    std::lock_guard<std::mutex> lk(g_logMutex);
+    std::wstring path = LogPath();
+    RotateLogIfNeeded(path);
+
     SYSTEMTIME st;
     GetLocalTime(&st);
-    wchar_t buf[64];
-    swprintf_s(buf, L"%04d-%02d-%02d %02d:%02d:%02d",
+    wchar_t ts[64];
+    swprintf_s(ts, L"%04d-%02d-%02d %02d:%02d:%02d",
                st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
-    return buf;
-}
 
-static ULONGLONG FileTimeToU64(const FILETIME& ft)
-{
-    ULARGE_INTEGER u;
-    u.LowPart  = ft.dwLowDateTime;
-    u.HighPart = ft.dwHighDateTime;
-    return u.QuadPart;
+    std::wstring line = std::wstring(ts) + L" [" + level + L"] " + msg + L"\r\n";
+    std::string utf8 = ToUtf8(line);
+    if (utf8.empty()) return;
+
+    HANDLE h = CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ,
+                           nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD written = 0;
+    WriteFile(h, utf8.data(), (DWORD)utf8.size(), &written, nullptr);
+    CloseHandle(h);
 }
 
 // ---------------------------------------------------------------------------
-//  Logging (rotating, ~256 KB)
+// State (server index)
 // ---------------------------------------------------------------------------
-static void Log(const std::wstring& msg)
-{
-    std::lock_guard<std::mutex> lk(g_logMx);
-    if (g_dir.empty()) return;
+static size_t LoadIndex() {
+    std::ifstream f(StatePath());
+    if (!f) return 0;
+    long long v = 0;
+    f >> v;
+    if (v < 0) v = 0;
+    return (size_t)v;
+}
 
-    std::wstring path = g_dir + L"vpnagent.log";
+static void SaveIndex(size_t v) {
+    std::ofstream f(StatePath(), std::ios::trunc);
+    if (!f) return;
+    f << (unsigned long long)v;
+}
 
-    WIN32_FILE_ATTRIBUTE_DATA fad;
-    if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad))
-    {
-        ULARGE_INTEGER sz;
-        sz.LowPart  = fad.nFileSizeLow;
-        sz.HighPart = fad.nFileSizeHigh;
-        if (sz.QuadPart > 256 * 1024)
-        {
-            std::wstring oldPath = g_dir + L"vpnagent.old.log";
-            DeleteFileW(oldPath.c_str());
-            MoveFileW(path.c_str(), oldPath.c_str());
+// ---------------------------------------------------------------------------
+// HTTP (WinINet)
+// ---------------------------------------------------------------------------
+static bool HttpRequest(const std::wstring& url, const wchar_t* verb,
+                        std::string* out, DWORD timeoutMs, DWORD* statusOut) {
+    HINTERNET hInet = InternetOpenW(L"VpnAgent/1.0", INTERNET_OPEN_TYPE_PRECONFIG,
+                                    nullptr, nullptr, 0);
+    if (!hInet) return false;
+
+    InternetSetOptionW(hInet, INTERNET_OPTION_CONNECT_TIMEOUT, &timeoutMs, sizeof(timeoutMs));
+    InternetSetOptionW(hInet, INTERNET_OPTION_RECEIVE_TIMEOUT, &timeoutMs, sizeof(timeoutMs));
+    InternetSetOptionW(hInet, INTERNET_OPTION_SEND_TIMEOUT,    &timeoutMs, sizeof(timeoutMs));
+
+    URL_COMPONENTS uc{};
+    uc.dwStructSize = sizeof(uc);
+    wchar_t host[256] = {};
+    wchar_t path[2048] = {};
+    uc.lpszHostName = host; uc.dwHostNameLength = 255;
+    uc.lpszUrlPath  = path; uc.dwUrlPathLength  = 2047;
+
+    if (!InternetCrackUrlW(url.c_str(), (DWORD)url.size(), 0, &uc)) {
+        InternetCloseHandle(hInet);
+        return false;
+    }
+
+    DWORD flags = INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE | INTERNET_FLAG_KEEP_CONNECTION;
+    if (uc.nScheme == INTERNET_SCHEME_HTTPS) {
+        flags |= INTERNET_FLAG_SECURE | INTERNET_FLAG_IGNORE_CERT_CN_INVALID | INTERNET_FLAG_IGNORE_CERT_DATE_INVALID;
+    }
+
+    HINTERNET hConn = InternetConnectW(hInet, host, uc.nPort, nullptr, nullptr,
+                                       INTERNET_SERVICE_HTTP, 0, 0);
+    if (!hConn) { InternetCloseHandle(hInet); return false; }
+
+    HINTERNET hReq = HttpOpenRequestW(hConn, verb, path, nullptr, nullptr, nullptr, flags, 0);
+    if (!hReq) { InternetCloseHandle(hConn); InternetCloseHandle(hInet); return false; }
+
+    bool ok = HttpSendRequestW(hReq, nullptr, 0, nullptr, 0) != FALSE;
+
+    if (statusOut) {
+        DWORD code = 0, len = sizeof(code);
+        if (HttpQueryInfoW(hReq, HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER, &code, &len, nullptr))
+            *statusOut = code;
+        else
+            *statusOut = 0;
+    }
+
+    if (ok && out) {
+        out->clear();
+        char buf[8192];
+        DWORD read = 0;
+        while (InternetReadFile(hReq, buf, (DWORD)sizeof(buf), &read) && read > 0) {
+            out->append(buf, read);
         }
     }
 
-    std::wstring line = TimeStamp() + L"  " + msg + L"\r\n";
-    std::string  u8   = WideToUtf8(line);
-
-    FILE* f = NULL;
-    if (_wfopen_s(&f, path.c_str(), L"ab") == 0 && f)
-    {
-        fwrite(u8.data(), 1, u8.size(), f);
-        fclose(f);
-    }
+    InternetCloseHandle(hReq);
+    InternetCloseHandle(hConn);
+    InternetCloseHandle(hInet);
+    return ok;
 }
 
-// ---------------------------------------------------------------------------
-//  File helpers
-// ---------------------------------------------------------------------------
-static bool ReadFileAll(const std::wstring& path, std::string& out)
-{
-    out.clear();
-    FILE* f = NULL;
-    if (_wfopen_s(&f, path.c_str(), L"rb") != 0 || !f) return false;
-    fseek(f, 0, SEEK_END);
-    long n = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    if (n > 0)
-    {
-        out.resize((size_t)n);
-        size_t got = fread(&out[0], 1, (size_t)n, f);
-        out.resize(got);
+static bool HasInternet() {
+    DWORD status = 0;
+    bool ok = HttpRequest(kCsvUrl, L"HEAD", nullptr, 5000, &status);
+    return ok && status != 0;
+}
+
+static bool CsvCacheFresh(DWORD maxAgeSec) {
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    if (!GetFileAttributesExW(CsvPath().c_str(), GetFileExInfoStandard, &fad)) return false;
+    FILETIME now;
+    GetSystemTimeAsFileTime(&now);
+    ULARGE_INTEGER a, b;
+    a.LowPart  = fad.ftLastWriteTime.dwLowDateTime;
+    a.HighPart = fad.ftLastWriteTime.dwHighDateTime;
+    b.LowPart  = now.dwLowDateTime;
+    b.HighPart = now.dwHighDateTime;
+    unsigned long long age = (b.QuadPart - a.QuadPart) / 10000000ULL;
+    return age < (unsigned long long)maxAgeSec;
+}
+
+static bool DownloadCsv() {
+    std::string data;
+    DWORD status = 0;
+    if (!HttpRequest(kCsvUrl, L"GET", &data, 30000, &status)) {
+        Log(L"ERROR", L"CSV download failed (network)");
+        return false;
     }
-    fclose(f);
+    if (status != 200 || data.empty()) {
+        Log(L"ERROR", L"CSV download bad status " + std::to_wstring(status));
+        return false;
+    }
+    HANDLE h = CreateFileW(CsvPath().c_str(), GENERIC_WRITE, 0, nullptr,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        Log(L"ERROR", L"CSV cannot open for write");
+        return false;
+    }
+    DWORD written = 0;
+    BOOL ok = WriteFile(h, data.data(), (DWORD)data.size(), &written, nullptr);
+    CloseHandle(h);
+    if (!ok || written != data.size()) {
+        Log(L"ERROR", L"CSV write incomplete");
+        return false;
+    }
+    Log(L"INFO", L"CSV downloaded (" + std::to_wstring(data.size()) + L" bytes)");
     return true;
 }
 
-static bool WriteFileAll(const std::wstring& path, const std::string& data)
-{
-    FILE* f = NULL;
-    if (_wfopen_s(&f, path.c_str(), L"wb") != 0 || !f) return false;
-    if (!data.empty()) fwrite(data.data(), 1, data.size(), f);
-    fclose(f);
-    return true;
+static bool ReadFileToString(const std::wstring& path, std::string& out) {
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER sz{};
+    if (!GetFileSizeEx(h, &sz) || sz.QuadPart <= 0 || sz.QuadPart > (LONGLONG)(64 * 1024 * 1024)) {
+        CloseHandle(h);
+        return false;
+    }
+    out.resize((size_t)sz.QuadPart);
+    DWORD total = 0;
+    while (total < out.size()) {
+        DWORD rd = 0;
+        if (!ReadFile(h, out.data() + total, (DWORD)(out.size() - total), &rd, nullptr) || rd == 0) break;
+        total += rd;
+    }
+    CloseHandle(h);
+    out.resize(total);
+    return total > 0;
 }
 
 // ---------------------------------------------------------------------------
-//  Base64
+// CSV parsing
 // ---------------------------------------------------------------------------
-static int B64Val(unsigned char c)
-{
+static std::vector<std::vector<std::string>> ParseCsvRows(const std::string& data) {
+    std::vector<std::vector<std::string>> rows;
+    std::vector<std::string> row;
+    std::string field;
+    bool inQuotes = false;
+    bool fieldStarted = false;
+    for (size_t i = 0; i < data.size(); ++i) {
+        char c = data[i];
+        if (inQuotes) {
+            if (c == '"') {
+                if (i + 1 < data.size() && data[i + 1] == '"') { field.push_back('"'); ++i; }
+                else inQuotes = false;
+            } else {
+                field.push_back(c);
+            }
+        } else {
+            if (c == '"' && !fieldStarted) { inQuotes = true; fieldStarted = true; }
+            else if (c == ',') { row.push_back(field); field.clear(); fieldStarted = false; }
+            else if (c == '\n') { row.push_back(field); field.clear(); fieldStarted = false; rows.push_back(row); row.clear(); }
+            else if (c == '\r') { /* skip */ }
+            else { field.push_back(c); fieldStarted = true; }
+        }
+    }
+    if (!field.empty() || !row.empty()) { row.push_back(field); rows.push_back(row); }
+    return rows;
+}
+
+static int B64Val(char c) {
     if (c >= 'A' && c <= 'Z') return c - 'A';
     if (c >= 'a' && c <= 'z') return c - 'a' + 26;
     if (c >= '0' && c <= '9') return c - '0' + 52;
@@ -168,803 +329,530 @@ static int B64Val(unsigned char c)
     return -1;
 }
 
-static std::string Base64Decode(const std::string& in)
-{
-    std::string out;
-    out.reserve(in.size() * 3 / 4 + 4);
-    int buf = 0, bits = 0;
-    for (size_t i = 0; i < in.size(); ++i)
-    {
-        unsigned char c = (unsigned char)in[i];
+static bool Base64Decode(const std::string& in, std::string& out) {
+    out.clear();
+    int val = 0, bits = 0;
+    for (char c : in) {
         if (c == '=') break;
+        if (c == '\r' || c == '\n' || c == ' ' || c == '\t') continue;
         int v = B64Val(c);
-        if (v < 0) continue;             // skip CR/LF/space
-        buf = (buf << 6) | v;
+        if (v < 0) return false;
+        val = (val << 6) | v;
         bits += 6;
-        if (bits >= 8)
-        {
+        if (bits >= 8) {
             bits -= 8;
-            out.push_back((char)((buf >> bits) & 0xFF));
+            out.push_back((char)((val >> bits) & 0xFF));
         }
     }
-    return out;
-}
-
-// ---------------------------------------------------------------------------
-//  WinHTTP
-// ---------------------------------------------------------------------------
-static bool HttpRequest(const std::wstring& url, const wchar_t* verb,
-                        std::string* out, DWORD timeoutMs, DWORD* statusOut)
-{
-    if (statusOut) *statusOut = 0;
-
-    URL_COMPONENTS uc;
-    ZeroMemory(&uc, sizeof(uc));
-    uc.dwStructSize      = sizeof(uc);
-    uc.dwSchemeLength    = (DWORD)-1;
-    uc.dwHostNameLength  = (DWORD)-1;
-    uc.dwUrlPathLength   = (DWORD)-1;
-    uc.dwExtraInfoLength = (DWORD)-1;
-
-    if (!WinHttpCrackUrl(url.c_str(), (DWORD)url.size(), 0, &uc)) return false;
-
-    std::wstring host(uc.lpszHostName, uc.dwHostNameLength);
-    std::wstring path(uc.lpszUrlPath, uc.dwUrlPathLength);
-    if (uc.dwExtraInfoLength)
-        path.append(uc.lpszExtraInfo, uc.dwExtraInfoLength);
-    bool https = (uc.nScheme == INTERNET_SCHEME_HTTPS);
-
-    HINTERNET hSession = WinHttpOpen(L"VpnGateAgent/1.0",
-                                     WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-                                     WINHTTP_NO_PROXY_NAME,
-                                     WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!hSession) return false;
-
-    WinHttpSetTimeouts(hSession, timeoutMs, timeoutMs, timeoutMs, timeoutMs);
-
-    DWORD retries = 1;
-    WinHttpSetOption(hSession, WINHTTP_OPTION_CONNECT_RETRIES, &retries, sizeof(retries));
-
-    HINTERNET hConnect = WinHttpConnect(hSession, host.c_str(), uc.nPort, 0);
-    if (!hConnect) { WinHttpCloseHandle(hSession); return false; }
-
-    HINTERNET hRequest = WinHttpOpenRequest(hConnect, verb, path.c_str(), NULL,
-                                            WINHTTP_NO_REFERER,
-                                            WINHTTP_DEFAULT_ACCEPT_TYPES,
-                                            https ? WINHTTP_FLAG_SECURE : 0);
-    if (!hRequest)
-    {
-        WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
-        return false;
-    }
-
-    DWORD policy = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
-    WinHttpSetOption(hRequest, WINHTTP_OPTION_REDIRECT_POLICY, &policy, sizeof(policy));
-
-    BOOL ok = WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-                                 WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
-    if (ok) ok = WinHttpReceiveResponse(hRequest, NULL);
-
-    DWORD status = 0;
-    if (ok)
-    {
-        DWORD len = sizeof(status);
-        WinHttpQueryHeaders(hRequest,
-                            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                            WINHTTP_HEADER_NAME_BY_INDEX, &status, &len,
-                            WINHTTP_NO_HEADER_INDEX);
-    }
-    if (statusOut) *statusOut = status;
-
-    bool result = ok && status >= 200 && status < 300;
-
-    if (result && out)
-    {
-        out->clear();
-        for (;;)
-        {
-            DWORD avail = 0;
-            if (!WinHttpQueryDataAvailable(hRequest, &avail) || avail == 0) break;
-            std::string buf(avail, 0);
-            DWORD read = 0;
-            if (!WinHttpReadData(hRequest, &buf[0], avail, &read) || read == 0) break;
-            out->append(buf.data(), read);
-        }
-    }
-
-    WinHttpCloseHandle(hRequest);
-    WinHttpCloseHandle(hConnect);
-    WinHttpCloseHandle(hSession);
-    return result;
-}
-
-// Light internet probe: HEAD on the CSV host. Any HTTP status means "online".
-static bool HasInternet()
-{
-    DWORD status = 0;
-    HttpRequest(kCsvUrl, L"HEAD", NULL, 5000, &status);
-    return status != 0;
-}
-
-// ---------------------------------------------------------------------------
-//  vpncmd wrapper
-// ---------------------------------------------------------------------------
-static bool RunVpnCmd(const std::wstring& args, std::string& output, DWORD timeoutMs)
-{
-    output.clear();
-
-    if (GetFileAttributesW(kVpnCmd.c_str()) == INVALID_FILE_ATTRIBUTES)
-    {
-        output = "vpncmd.exe not found";
-        return false;
-    }
-
-    std::wstring cmd = L"\"" + kVpnCmd + L"\" localhost /CLIENT /CMD " + args;
-
-    SECURITY_ATTRIBUTES sa;
-    sa.nLength        = sizeof(sa);
-    sa.lpSecurityDescriptor = NULL;
-    sa.bInheritHandle = TRUE;
-
-    HANDLE rd = NULL, wr = NULL;
-    if (!CreatePipe(&rd, &wr, &sa, 0)) return false;
-    SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
-
-    HANDLE hNul = CreateFileW(L"NUL", GENERIC_READ,
-                              FILE_SHARE_READ | FILE_SHARE_WRITE,
-                              &sa, OPEN_EXISTING, 0, NULL);
-
-    STARTUPINFOW si;
-    ZeroMemory(&si, sizeof(si));
-    si.cb          = sizeof(si);
-    si.dwFlags     = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
-    si.hStdOutput  = wr;
-    si.hStdError   = wr;
-    si.hStdInput   = hNul;
-
-    PROCESS_INFORMATION pi;
-    ZeroMemory(&pi, sizeof(pi));
-
-    std::vector<wchar_t> buf(cmd.begin(), cmd.end());
-    buf.push_back(0);
-
-    BOOL created = CreateProcessW(NULL, buf.data(), NULL, NULL, TRUE,
-                                  CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
-
-    CloseHandle(wr);
-    if (hNul) CloseHandle(hNul);
-
-    if (!created)
-    {
-        CloseHandle(rd);
-        return false;
-    }
-
-    DWORD start = GetTickCount();
-    bool  killed = false;
-
-    for (;;)
-    {
-        DWORD avail = 0;
-        if (PeekNamedPipe(rd, NULL, 0, NULL, &avail, NULL) && avail > 0)
-        {
-            char  tmp[4096];
-            DWORD got = 0;
-            DWORD toRead = avail > sizeof(tmp) ? (DWORD)sizeof(tmp) : avail;
-            if (ReadFile(rd, tmp, toRead, &got, NULL) && got > 0)
-                output.append(tmp, got);
-            continue;
-        }
-
-        if (WaitForSingleObject(pi.hProcess, 50) == WAIT_OBJECT_0)
-        {
-            // drain remaining
-            for (;;)
-            {
-                DWORD a2 = 0;
-                if (!PeekNamedPipe(rd, NULL, 0, NULL, &a2, NULL) || a2 == 0) break;
-                char  tmp[4096];
-                DWORD got = 0;
-                DWORD toRead = a2 > sizeof(tmp) ? (DWORD)sizeof(tmp) : a2;
-                if (!ReadFile(rd, tmp, toRead, &got, NULL) || got == 0) break;
-                output.append(tmp, got);
-            }
-            break;
-        }
-
-        if (GetTickCount() - start > timeoutMs)
-        {
-            TerminateProcess(pi.hProcess, 1);
-            killed = true;
-            break;
-        }
-    }
-
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
-    CloseHandle(rd);
-    return !killed;
-}
-
-static bool CmdSucceeded(const std::string& out)
-{
-    return out.find("completed successfully") != std::string::npos;
-}
-
-// ---------------------------------------------------------------------------
-//  Connection state
-// ---------------------------------------------------------------------------
-static bool IsAccountConnected()
-{
-    std::string out;
-    if (!RunVpnCmd(L"AccountList", out, 15000)) return false;
-
-    const std::string acct = WideToUtf8(kAccount);
-    size_t pos = 0;
-    while ((pos = out.find(acct, pos)) != std::string::npos)
-    {
-        size_t eol  = out.find('\n', pos);
-        std::string line = out.substr(pos, (eol == std::string::npos ? out.size() : eol) - pos);
-
-        if (line.find("Not Connected") != std::string::npos)
-        {
-            pos += acct.size();
-            continue;
-        }
-        if (line.find("Connected") != std::string::npos)
-            return true;
-
-        pos += acct.size();
-    }
-    return false;
-}
-
-static bool DisconnectAccount()
-{
-    std::string out;
-    RunVpnCmd(L"AccountDisconnect " + kAccount, out, 15000);
     return true;
 }
 
-// Creates the account (delete + create). Tries the explicit anonymous auth
-// type first; if the vpncmd build rejects the option, retries without it.
-static bool CreateAccount(const std::string& ip, int port)
-{
-    std::string out;
-    RunVpnCmd(L"AccountDelete " + kAccount, out, 15000);   // ignore result
-
-    std::wstring server = Utf8ToWide(ip) + L":" + std::to_wstring(port);
-
-    std::wstring base =
-        L"AccountCreate " + kAccount +
-        L" /SERVER:"   + server +
-        L" /HUB:"      + kHub +
-        L" /USERNAME:" + kUser +
-        L" /PASSWORD:" + kPass +
-        L" /NICNAME:"  + kNic;
-
-    std::string o1;
-    RunVpnCmd(base + L" /AUTHTYPE:anonymous", o1, 20000);
-    if (CmdSucceeded(o1)) return true;
-
-    std::string o2;
-    RunVpnCmd(base, o2, 20000);
-    if (CmdSucceeded(o2)) return true;
-
-    Log(L"AccountCreate failed: " + Utf8ToWide(o2));
-    return false;
-}
-
-// ---------------------------------------------------------------------------
-//  CSV handling
-// ---------------------------------------------------------------------------
-struct Server
-{
-    std::string ip;
-    std::string country;
-    int         port;
-};
-
-static std::vector<std::string> SplitCsvLine(const std::string& line)
-{
-    std::vector<std::string> f;
-    std::string cur;
-    bool inq = false;
-
-    for (size_t i = 0; i < line.size(); ++i)
-    {
-        char c = line[i];
-        if (inq)
-        {
-            if (c == '"')
-            {
-                if (i + 1 < line.size() && line[i + 1] == '"') { cur += '"'; ++i; }
-                else inq = false;
-            }
-            else cur += c;
-        }
-        else
-        {
-            if (c == '"')      inq = true;
-            else if (c == ',') { f.push_back(cur); cur.clear(); }
-            else               cur += c;
-        }
-    }
-    f.push_back(cur);
-    return f;
-}
-
-static int ExtractPort(const std::string& b64)
-{
-    if (b64.empty()) return 443;
-
-    std::string cfg = Base64Decode(b64);
-    std::istringstream iss(cfg);
-    std::string line;
-
-    while (std::getline(iss, line))
-    {
+static int ExtractPortFromBase64(const std::string& b64) {
+    std::string cfg;
+    if (!Base64Decode(b64, cfg)) return 443;
+    size_t pos = 0;
+    while (pos < cfg.size()) {
+        size_t eol = cfg.find('\n', pos);
+        std::string line = (eol == std::string::npos) ? cfg.substr(pos) : cfg.substr(pos, eol - pos);
+        pos = (eol == std::string::npos) ? cfg.size() : eol + 1;
         while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t'))
             line.pop_back();
-        size_t p = line.find_first_not_of(" \t");
-        if (p == std::string::npos) continue;
-        line = line.substr(p);
-
-        if (line.rfind("remote", 0) == 0 &&
-            (line.size() == 6 || line[6] == ' ' || line[6] == '\t'))
-        {
-            std::istringstream ls(line);
-            std::string kw, ip, port;
-            ls >> kw >> ip >> port;
-            if (!port.empty())
-            {
-                int v = atoi(port.c_str());
-                if (v > 0 && v < 65536) return v;
+        if (line.rfind("remote ", 0) == 0) {
+            std::istringstream iss(line);
+            std::string tok, host, port;
+            iss >> tok >> host >> port;
+            if (!port.empty()) {
+                int p = ParseIntSimple(port);
+                if (p > 0 && p <= 65535) return p;
             }
         }
     }
     return 443;
 }
 
-static bool ParseCsv(const std::string& data, std::vector<Server>& servers)
-{
-    servers.clear();
-    std::istringstream iss(data);
-    std::string line;
+struct Server {
+    std::wstring host;
+    std::wstring ip;
+    int port = 443;
+};
 
-    while (std::getline(iss, line))
-    {
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        if (line.empty()) continue;
-        if (line[0] == '*' || line[0] == '#') continue;   // comments / header
-
-        std::vector<std::string> f = SplitCsvLine(line);
-        if (f.size() < 15) continue;
-
+static std::vector<Server> ParseServers(const std::string& data) {
+    std::vector<Server> out;
+    auto rows = ParseCsvRows(data);
+    for (auto& r : rows) {
+        if (r.empty()) continue;
+        const std::string& first = r[0];
+        if (!first.empty() && first[0] == '*') continue;
+        if (first.rfind("#HostName", 0) == 0) continue;
+        if (r.size() < 15) continue;
         Server s;
-        s.ip      = f[1];
-        s.country = f[5];
+        s.host = FromUtf8(r[0]);
+        s.ip   = FromUtf8(r[1]);
         if (s.ip.empty()) continue;
-
-        s.port = ExtractPort(f[14]);
-        servers.push_back(s);
+        s.port = ExtractPortFromBase64(r[14]);
+        out.push_back(std::move(s));
     }
-    return !servers.empty();
+    return out;
 }
 
-static bool CsvAgeMinutes(DWORD& outMinutes)
-{
-    WIN32_FILE_ATTRIBUTE_DATA fad;
-    if (!GetFileAttributesExW((g_dir + L"vpngate.csv").c_str(),
-                              GetFileExInfoStandard, &fad))
-        return false;
-
-    FILETIME nowFt;
-    GetSystemTimeAsFileTime(&nowFt);
-
-    ULONGLONG now  = FileTimeToU64(nowFt);
-    ULONGLONG then = FileTimeToU64(fad.ftLastWriteTime);
-    if (now <= then) { outMinutes = 0; return true; }
-
-    outMinutes = (DWORD)((now - then) / (60ULL * 10000000ULL));
-    return true;
-}
-
-static bool DownloadCsv()
-{
+static std::vector<Server> LoadServers(bool forceDownload) {
+    bool need = forceDownload || !CsvCacheFresh(45 * 60);
+    if (need) {
+        if (!DownloadCsv()) {
+            Log(L"WARN", L"download failed; using cached CSV if any");
+        }
+    }
     std::string data;
-    DWORD status = 0;
-
-    if (!HttpRequest(kCsvUrl, L"GET", &data, 20000, &status))
-    {
-        Log(L"CSV download failed (http status " + std::to_wstring(status) + L")");
-        return false;
+    if (!ReadFileToString(CsvPath(), data)) {
+        Log(L"ERROR", L"cannot read CSV file");
+        return {};
     }
-    if (data.size() < 256 || data.find("OpenVPN_ConfigData_Base64") == std::string::npos)
-    {
-        Log(L"CSV download looks invalid (size " + std::to_wstring(data.size()) + L")");
-        return false;
-    }
-
-    std::wstring tmp = g_dir + L"vpngate.csv.tmp";
-    std::wstring dst = g_dir + L"vpngate.csv";
-
-    if (!WriteFileAll(tmp, data))
-    {
-        Log(L"Cannot write CSV cache");
-        return false;
-    }
-    if (!MoveFileExW(tmp.c_str(), dst.c_str(), MOVEFILE_REPLACE_EXISTING))
-    {
-        DeleteFileW(tmp.c_str());
-        Log(L"Cannot replace CSV cache");
-        return false;
-    }
-
-    Log(L"CSV downloaded (" + std::to_wstring(data.size()) + L" bytes)");
-    return true;
-}
-
-static bool EnsureCsv(std::vector<Server>& servers, bool force)
-{
-    DWORD age = 0;
-    bool  haveCache = CsvAgeMinutes(age);
-    bool  stale     = !haveCache || age >= kCsvMaxAgeMin;
-
-    if (force || stale)
-        DownloadCsv();
-
-    std::string data;
-    if (!ReadFileAll(g_dir + L"vpngate.csv", data))
-    {
-        Log(L"No CSV cache available");
-        return false;
-    }
-    if (!ParseCsv(data, servers))
-    {
-        Log(L"CSV parse produced no servers");
-        return false;
-    }
-    return true;
+    auto servers = ParseServers(data);
+    Log(L"INFO", L"loaded " + std::to_wstring(servers.size()) + L" servers");
+    return servers;
 }
 
 // ---------------------------------------------------------------------------
-//  Index state file
+// vpncmd execution
 // ---------------------------------------------------------------------------
-static int LoadIndex()
-{
-    std::string s;
-    if (!ReadFileAll(g_dir + L"state.txt", s)) return 0;
-    int v = atoi(s.c_str());
-    return v < 0 ? 0 : v;
-}
+static bool RunVpnCmd(const std::wstring& args, std::wstring& output, DWORD timeoutMs) {
+    output.clear();
+    if (args.empty()) return false;
 
-static void SaveIndex(int idx)
-{
-    WriteFileAll(g_dir + L"state.txt", std::to_string(idx));
-}
+    std::wstring cmdLine = L"\"" + std::wstring(kVpnCmdPath) + L"\" " + args;
 
-// ---------------------------------------------------------------------------
-//  Tray notification
-// ---------------------------------------------------------------------------
-static void NotifyTray(const std::wstring& msg)
-{
-    if (!g_hwnd) return;
+    SECURITY_ATTRIBUTES sa{};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+    sa.lpSecurityDescriptor = nullptr;
 
-    NOTIFYICONDATAW nid;
-    ZeroMemory(&nid, sizeof(nid));
-    nid.cbSize = sizeof(nid);
-    nid.hWnd   = g_hwnd;
-    nid.uID    = 1;
-    nid.uFlags = NIF_ICON | NIF_TIP | NIF_INFO;
-    nid.hIcon  = LoadIconW(NULL, IDI_APPLICATION);
-    wcscpy_s(nid.szTip, L"VPN Gate Agent");
-    wcscpy_s(nid.szInfoTitle, L"VPN Gate Agent");
-    wcsncpy_s(nid.szInfo, msg.c_str(), _TRUNCATE);
-    nid.dwInfoFlags = NIIF_INFO;
-    nid.uTimeout    = 10000;
+    HANDLE hRead = nullptr, hWrite = nullptr;
+    if (!CreatePipe(&hRead, &hWrite, &sa, 0)) return false;
+    SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0);
 
-    if (Shell_NotifyIconW(NIM_ADD, &nid))
-        Shell_NotifyIconW(NIM_MODIFY, &nid);
-}
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    si.hStdOutput = hWrite;
+    si.hStdError  = hWrite;
+    si.hStdInput  = nullptr;
 
-// ---------------------------------------------------------------------------
-//  Interruptible wait
-// ---------------------------------------------------------------------------
-static bool WaitWake(DWORD ms)
-{
-    return WaitForSingleObject(g_wake, ms) == WAIT_OBJECT_0;
-}
+    PROCESS_INFORMATION pi{};
+    std::vector<wchar_t> buf(cmdLine.begin(), cmdLine.end());
+    buf.push_back(0);
 
-// ---------------------------------------------------------------------------
-//  Single connection attempt
-// ---------------------------------------------------------------------------
-static bool TryConnect(const Server& s)
-{
-    Log(L"Trying " + Utf8ToWide(s.ip) + L":" + std::to_wstring(s.port) +
-        L" (" + Utf8ToWide(s.country) + L")");
+    BOOL ok = CreateProcessW(nullptr, buf.data(), nullptr, nullptr, TRUE,
+                             CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+    CloseHandle(hWrite);
+    if (!ok) { CloseHandle(hRead); return false; }
 
-    DisconnectAccount();
-
-    if (!CreateAccount(s.ip, s.port))
-        return false;
-
-    std::string out;
-    RunVpnCmd(L"AccountConnect " + kAccount, out, kConnectTimeout);
-
+    std::string acc;
     DWORD start = GetTickCount();
-    for (;;)
-    {
-        if (IsAccountConnected()) return true;
-        if (GetTickCount() - start > kVerifyTimeout) break;
-        Sleep(1000);
+    bool timedOut = false;
+    bool exited = false;
+
+    for (;;) {
+        DWORD avail = 0;
+        if (PeekNamedPipe(hRead, nullptr, 0, nullptr, &avail, nullptr) && avail > 0) {
+            char tmp[4096];
+            DWORD toRead = (avail < (DWORD)sizeof(tmp)) ? avail : (DWORD)sizeof(tmp);
+            DWORD rd = 0;
+            if (ReadFile(hRead, tmp, toRead, &rd, nullptr) && rd > 0)
+                acc.append(tmp, rd);
+        } else {
+            DWORD w = WaitForSingleObject(pi.hProcess, 50);
+            if (w == WAIT_OBJECT_0) {
+                for (;;) {
+                    DWORD a2 = 0;
+                    if (!PeekNamedPipe(hRead, nullptr, 0, nullptr, &a2, nullptr) || a2 == 0) break;
+                    char tmp[4096];
+                    DWORD toRead = (a2 < (DWORD)sizeof(tmp)) ? a2 : (DWORD)sizeof(tmp);
+                    DWORD rd = 0;
+                    if (!ReadFile(hRead, tmp, toRead, &rd, nullptr) || rd == 0) break;
+                    acc.append(tmp, rd);
+                }
+                exited = true;
+                break;
+            }
+        }
+        if (GetTickCount() - start > timeoutMs) { timedOut = true; break; }
     }
 
-    DisconnectAccount();
-    Log(L"Attempt failed for " + Utf8ToWide(s.ip));
+    if (timedOut) {
+        TerminateProcess(pi.hProcess, 1);
+        WaitForSingleObject(pi.hProcess, 2000);
+    }
+
+    DWORD exitCode = 1;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    CloseHandle(hRead);
+
+    output = FromAcp(acc);
+    if (timedOut) return false;
+    return exited && exitCode == 0;
+}
+
+// ---------------------------------------------------------------------------
+// vpncmd output helpers
+// ---------------------------------------------------------------------------
+static std::wstring ShortErr(const std::wstring& out) {
+    std::wstring res;
+    int count = 0;
+    size_t pos = 0;
+    while (pos < out.size() && count < 3) {
+        size_t e = out.find(L'\n', pos);
+        std::wstring line = (e == std::wstring::npos) ? out.substr(pos) : out.substr(pos, e - pos);
+        pos = (e == std::wstring::npos) ? out.size() : e + 1;
+        while (!line.empty() && (line.back() == L'\r' || line.back() == L' ' || line.back() == L'\t'))
+            line.pop_back();
+        if (line.empty()) continue;
+        std::wstring low;
+        low.reserve(line.size());
+        for (wchar_t c : line) low.push_back((wchar_t)towlower(c));
+        if (low.find(L"vpncmd command") != std::wstring::npos) continue;
+        if (low.find(L"softether vpn command line") != std::wstring::npos) continue;
+        if (low.rfind(L"version ", 0) == 0) continue;
+        res += line;
+        res += L" | ";
+        count++;
+    }
+    return res;
+}
+
+static bool StatusConnected(const std::wstring& out) {
+    size_t pos = 0;
+    while (pos <= out.size()) {
+        size_t e = out.find(L'\n', pos);
+        std::wstring line = (e == std::wstring::npos) ? out.substr(pos) : out.substr(pos, e - pos);
+        pos = (e == std::wstring::npos) ? out.size() + 1 : e + 1;
+
+        size_t bar = line.find(L'|');
+        if (bar == std::wstring::npos) continue;
+
+        std::wstring left  = line.substr(0, bar);
+        std::wstring right = line.substr(bar + 1);
+
+        auto trim = [](std::wstring& s) {
+            size_t a = s.find_first_not_of(L" \t\r");
+            size_t b = s.find_last_not_of(L" \t\r");
+            if (a == std::wstring::npos) { s.clear(); return; }
+            s = s.substr(a, b - a + 1);
+        };
+        trim(left);
+        trim(right);
+
+        std::wstring llow, rlow;
+        llow.reserve(left.size());
+        rlow.reserve(right.size());
+        for (wchar_t c : left)  llow.push_back((wchar_t)towlower(c));
+        for (wchar_t c : right) rlow.push_back((wchar_t)towlower(c));
+
+        if (llow.find(L"status") != std::wstring::npos && rlow == L"connected")
+            return true;
+    }
     return false;
 }
 
-// ---------------------------------------------------------------------------
-//  Full connect cycle (all servers, up to two passes)
-// ---------------------------------------------------------------------------
-static void ConnectCycle()
-{
-    std::vector<Server> servers;
-    if (!EnsureCsv(servers, false))
-    {
-        Log(L"Cannot obtain server list, retrying in 60 s");
-        WaitWake(60000);
-        return;
-    }
-
-    int index = LoadIndex();
-    if (index >= (int)servers.size()) index = 0;
-    int pass = 0;
-
-    for (;;)
-    {
-        if (g_stop) return;
-
-        // Hotkey: if the cache went stale, refresh it and restart from saved index
-        if (g_hotkey.exchange(false))
-        {
-            DWORD age = 0;
-            bool haveCache = CsvAgeMinutes(age);
-            if (!haveCache || age >= kCsvMaxAgeMin)
-            {
-                Log(L"Hotkey: cache stale, refreshing CSV");
-                DownloadCsv();
-                if (EnsureCsv(servers, false))
-                {
-                    index = LoadIndex();
-                    if (index >= (int)servers.size()) index = 0;
-                }
-            }
-        }
-
-        if (index >= (int)servers.size())
-        {
-            if (pass >= 1)
-            {
-                // Two full passes failed -> notify, wait, retry silently
-                Log(L"All servers failed after two passes");
-                NotifyTray(L"No VPN Gate server reachable. Retrying every 10 minutes.");
-
-                DWORD waited = 0;
-                while (!g_stop && waited < kRetryWaitMs)
-                {
-                    if (WaitWake(30000)) { if (g_stop) return; g_hotkey = false; break; }
-                    waited += 30000;
-                }
-                if (g_stop) return;
-
-                pass  = 0;
-                index = 0;
-                SaveIndex(0);
-                DownloadCsv();
-                EnsureCsv(servers, false);
-                continue;
-            }
-
-            pass++;
-            index = 0;
-            SaveIndex(0);
-            Log(L"Server list exhausted, re-downloading CSV (pass " +
-                std::to_wstring(pass + 1) + L")");
-            DownloadCsv();
-            if (!EnsureCsv(servers, false))
-            {
-                WaitWake(60000);
-                return;
-            }
-            continue;
-        }
-
-        Server s = servers[index];
-        DWORD t0 = GetTickCount();
-
-        if (TryConnect(s))
-        {
-            SaveIndex(index);
-            Log(L"Connected to " + Utf8ToWide(s.ip) + L":" + std::to_wstring(s.port));
-            return;
-        }
-
-        // Guarantee the per-attempt bound even if vpncmd misbehaves
-        DWORD elapsed = GetTickCount() - t0;
-        if (elapsed < kAttemptTimeout && !g_stop)
-            Sleep(500);
-
-        index++;
-        SaveIndex(index);
-    }
+static bool IsTunnelConnected() {
+    std::wstring out;
+    if (!RunVpnCmd(L"/CLIENT localhost /CMD AccountStatusGet " + std::wstring(kAccountName), out, 8000))
+        return false;
+    return StatusConnected(out);
 }
 
 // ---------------------------------------------------------------------------
-//  Worker thread
+// Connection attempt for one server
 // ---------------------------------------------------------------------------
-static DWORD WINAPI WorkerEntry(LPVOID)
-{
-    Log(L"Worker started");
+enum class AttemptResult { Success, Fail, Timeout };
 
-    while (!g_stop)
+static AttemptResult ConnectServer(const std::wstring& ip, int port) {
+    using clock = std::chrono::steady_clock;
+    auto start = clock::now();
+    const long long TOTAL_MS = 25000;
+
+    auto remaining = [&]() -> DWORD {
+        auto el = std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - start).count();
+        long long r = TOTAL_MS - el;
+        if (r < 0) r = 0;
+        return (DWORD)r;
+    };
+
+    auto disconnect = [&]() {
+        std::wstring tmp;
+        RunVpnCmd(L"/CLIENT localhost /CMD AccountDisconnect " + std::wstring(kAccountName), tmp, 5000);
+    };
+
+    std::wstring out;
+    std::wstring spec = ip + L":" + std::to_wstring(port);
+    std::wstring acct = kAccountName;
+
+    // 1. delete previous account (ignore failure)
+    RunVpnCmd(L"/CLIENT localhost /CMD AccountDelete " + acct, out, 8000);
+
+    // 2. create account
     {
-        // 1. Internet availability
-        if (!HasInternet())
-        {
-            Log(L"No internet - polling every 30 s");
-            bool online = false;
-            while (!g_stop)
-            {
-                if (WaitWake(30000))
-                {
-                    if (g_stop) break;
-                    g_hotkey = false;   // ignored while offline
-                }
-                if (HasInternet()) { online = true; break; }
-            }
-            if (g_stop) break;
-            if (online) Log(L"Internet is back");
-            continue;
+        std::wstring args = L"/CLIENT localhost /CMD AccountCreate " + acct +
+                            L" /SERVER:" + spec +
+                            L" /HUB:VPNGATE /USERNAME:vpn /NICNAME:VPN";
+        DWORD t = remaining();
+        if (t > 10000) t = 10000;
+        if (t == 0 || !RunVpnCmd(args, out, t)) {
+            Log(L"ERROR", L"AccountCreate " + spec + L": " + ShortErr(out));
+            disconnect();
+            return AttemptResult::Fail;
         }
-
-        // 2. Already connected? keep the tunnel alive
-        if (IsAccountConnected())
-        {
-            Log(L"Tunnel is up - monitoring");
-            while (!g_stop)
-            {
-                if (WaitWake(10000))
-                {
-                    if (g_stop) break;
-                    g_hotkey = false;   // hotkey ignored while connected
-                }
-                if (!IsAccountConnected()) break;
-            }
-            if (g_stop) break;
-            Log(L"Tunnel dropped - reconnecting from saved index");
-            continue;
-        }
-
-        // 3. Connect
-        ConnectCycle();
     }
 
-    Log(L"Worker stopped");
-    return 0;
+    // 3. anonymous authentication
+    {
+        std::wstring o1;
+        DWORD t = remaining();
+        if (t > 8000) t = 8000;
+        if (t == 0 || !RunVpnCmd(L"/CLIENT localhost /CMD AccountAnonymousSet " + acct, o1, t)) {
+            std::wstring o2;
+            DWORD t2 = remaining();
+            if (t2 > 8000) t2 = 8000;
+            if (t2 == 0 || !RunVpnCmd(L"/CLIENT localhost /CMD AccountPasswordSet " + acct +
+                                      L" /PASSWORD: /TYPE:anonymous", o2, t2)) {
+                Log(L"WARN", L"anonymous set failed: " + ShortErr(o1) + L" || " + ShortErr(o2));
+                // continue; some builds may still connect
+            }
+        }
+    }
+
+    // 4. connect
+    {
+        DWORD t = remaining();
+        if (t > 10000) t = 10000;
+        std::wstring o;
+        if (t == 0 || !RunVpnCmd(L"/CLIENT localhost /CMD AccountConnect " + acct, o, t)) {
+            Log(L"ERROR", L"AccountConnect " + spec + L": " + ShortErr(o));
+            disconnect();
+            return AttemptResult::Fail;
+        }
+    }
+
+    // 5. poll status
+    for (;;) {
+        DWORD rem = remaining();
+        if (rem == 0) break;
+        Sleep(rem > 1500 ? 1500 : rem);
+        rem = remaining();
+        if (rem == 0) break;
+        DWORD t = rem > 8000 ? 8000 : rem;
+        std::wstring st;
+        if (RunVpnCmd(L"/CLIENT localhost /CMD AccountStatusGet " + acct, st, t)) {
+            if (StatusConnected(st)) {
+                Log(L"INFO", L"connected " + spec);
+                return AttemptResult::Success;
+            }
+        }
+    }
+
+    Log(L"WARN", L"timeout " + spec);
+    disconnect();
+    return AttemptResult::Timeout;
 }
 
 // ---------------------------------------------------------------------------
-//  Window / message handling
+// Tray balloon
 // ---------------------------------------------------------------------------
-static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
-{
-    switch (m)
-    {
+static void NotifyTrayBalloon() {
+    if (!g_msgWnd) return;
+    NOTIFYICONDATAW nid{};
+    nid.cbSize = sizeof(nid);
+    nid.hWnd = g_msgWnd;
+    nid.uID = 1;
+    nid.uFlags = NIF_INFO | NIF_ICON | NIF_MESSAGE;
+    nid.uCallbackMessage = WM_APP + 2;
+    nid.hIcon = LoadIconW(nullptr, IDI_INFORMATION);
+    nid.dwInfoFlags = NIIF_INFO;
+    wcscpy_s(nid.szInfoTitle, L"VPN Agent");
+    wcscpy_s(nid.szInfo, L"VPN Gate: no server reachable. Retrying in 10 minutes.");
+    nid.uTimeout = 10000;
+
+    if (!Shell_NotifyIconW(NIM_ADD, &nid)) {
+        Shell_NotifyIconW(NIM_MODIFY, &nid);
+    }
+    SetTimer(g_msgWnd, 1, 15000, nullptr);
+}
+
+// ---------------------------------------------------------------------------
+// Window / hotkey
+// ---------------------------------------------------------------------------
+static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    switch (m) {
     case WM_HOTKEY:
-        g_hotkey = true;
-        SetEvent(g_wake);
+        if (w == 1) OnHotkey();
         return 0;
-
-    case WM_QUERYENDSESSION:
-        return TRUE;
-
-    case WM_ENDSESSION:
-        g_stop = true;
-        SetEvent(g_wake);
-        DestroyWindow(h);
+    case WM_TIMER:
+        if (w == 1) {
+            KillTimer(h, 1);
+            NOTIFYICONDATAW nid{};
+            nid.cbSize = sizeof(nid);
+            nid.hWnd = h;
+            nid.uID = 1;
+            Shell_NotifyIconW(NIM_DELETE, &nid);
+        }
         return 0;
-
-    case WM_CLOSE:
-        g_stop = true;
-        SetEvent(g_wake);
-        DestroyWindow(h);
-        return 0;
-
     case WM_DESTROY:
         PostQuitMessage(0);
         return 0;
+    default:
+        break;
     }
     return DefWindowProcW(h, m, w, l);
 }
 
+static bool CreateMsgWindow(HINSTANCE hInst) {
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = WndProc;
+    wc.hInstance = hInst;
+    wc.lpszClassName = L"VpnAgentMsgWnd";
+    if (!RegisterClassExW(&wc)) return false;
+    g_msgWnd = CreateWindowExW(0, wc.lpszClassName, L"", 0, 0, 0, 0, 0,
+                               HWND_MESSAGE, nullptr, hInst, nullptr);
+    return g_msgWnd != nullptr;
+}
+
 // ---------------------------------------------------------------------------
-//  Entry point
+// Attempt cycle / worker
 // ---------------------------------------------------------------------------
-int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
-{
-    // --- single instance -------------------------------------------------
-    HANDLE hMutex = CreateMutexW(NULL, TRUE, L"Global\\VpnGateAgent_SingleInstance");
-    if (hMutex && GetLastError() == ERROR_ALREADY_EXISTS)
+enum class CycleResult { Connected, Exhausted, Busy, Offline, NoServers };
+
+static CycleResult AttemptCycle() {
+    std::unique_lock<std::mutex> lk(g_attemptMutex, std::try_to_lock);
+    if (!lk.owns_lock()) return CycleResult::Busy;
+
+    if (IsTunnelConnected()) return CycleResult::Connected;
+    if (!HasInternet())      return CycleResult::Offline;
+
+    std::vector<Server> servers = LoadServers(false);
+    if (servers.empty()) servers = LoadServers(true);
+    if (servers.empty()) return CycleResult::NoServers;
+
+    size_t idx = LoadIndex();
+    if (idx >= servers.size()) idx = 0;
+
+    for (; idx < servers.size(); ++idx) {
+        if (g_stop.load()) return CycleResult::Exhausted;
+        if (!HasInternet()) return CycleResult::Offline;
+
+        SaveIndex(idx);
+        Log(L"INFO", L"try " + servers[idx].ip + L":" + std::to_wstring(servers[idx].port));
+
+        AttemptResult r = ConnectServer(servers[idx].ip, servers[idx].port);
+        if (r == AttemptResult::Success) {
+            g_failedPasses = 0;
+            return CycleResult::Connected;
+        }
+    }
+
+    SaveIndex(0);
+    LoadServers(true);
+    return CycleResult::Exhausted;
+}
+
+static void WorkerThread() {
+    for (;;) {
+        if (g_stop.load()) return;
+
+        CycleResult r = AttemptCycle();
+        switch (r) {
+        case CycleResult::Connected:
+            WaitForSingleObject(g_wakeEvent, 10000);
+            break;
+        case CycleResult::Busy:
+            WaitForSingleObject(g_wakeEvent, 1000);
+            break;
+        case CycleResult::Offline:
+            WaitForSingleObject(g_wakeEvent, 30000);
+            break;
+        case CycleResult::NoServers:
+            WaitForSingleObject(g_wakeEvent, 60000);
+            break;
+        case CycleResult::Exhausted: {
+            int fp = ++g_failedPasses;
+            if (fp >= 2) {
+                g_failedPasses = 0;
+                Log(L"WARN", L"two full passes without success; waiting 10 minutes");
+                NotifyTrayBalloon();
+                WaitForSingleObject(g_wakeEvent, 600000);
+            } else {
+                WaitForSingleObject(g_wakeEvent, 2000);
+            }
+            break;
+        }
+        }
+    }
+}
+
+static void OnHotkey() {
+    Log(L"INFO", L"hotkey Ctrl+Alt+S");
+    if (g_stop.load()) return;
+    if (IsTunnelConnected()) {
+        Log(L"INFO", L"hotkey: already connected");
+        return;
+    }
+    std::thread([] {
+        AttemptCycle();
+    }).detach();
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+int wmain() {
+    // Hide console if any (background agent)
+    if (HWND cw = GetConsoleWindow()) ShowWindow(cw, SW_HIDE);
+
+    HANDLE hMutex = CreateMutexW(nullptr, TRUE, L"Global\\VpnGateAgent_9F3A71C2");
+    if (!hMutex) return 1;
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        CloseHandle(hMutex);
         return 0;
+    }
 
-    // --- program folder --------------------------------------------------
-    wchar_t exePath[MAX_PATH] = { 0 };
-    GetModuleFileNameW(NULL, exePath, MAX_PATH);
-    std::wstring p(exePath);
-    size_t slash = p.find_last_of(L'\\');
-    g_dir = (slash == std::wstring::npos) ? L".\\" : p.substr(0, slash + 1);
+    Log(L"INFO", L"agent starting");
 
-    Log(L"==================== Agent starting ====================");
-
-    g_wake = CreateEventW(NULL, FALSE, FALSE, NULL);
-    if (!g_wake)
-    {
-        Log(L"CreateEvent failed");
+    HINSTANCE hInst = GetModuleHandleW(nullptr);
+    if (!CreateMsgWindow(hInst)) {
+        Log(L"ERROR", L"cannot create message window");
+        CloseHandle(hMutex);
         return 1;
     }
 
-    // --- hidden window (tray balloon target) -----------------------------
-    WNDCLASSEXW wc;
-    ZeroMemory(&wc, sizeof(wc));
-    wc.cbSize        = sizeof(wc);
-    wc.lpfnWndProc   = WndProc;
-    wc.hInstance     = hInst;
-    wc.lpszClassName = L"VpnGateAgentWnd";
-    RegisterClassExW(&wc);
-
-    g_hwnd = CreateWindowExW(0, L"VpnGateAgentWnd", L"VpnGateAgent",
-                             0, 0, 0, 0, 0,
-                             NULL, NULL, hInst, NULL);
-    if (!g_hwnd)
-    {
-        Log(L"CreateWindowEx failed");
+    g_wakeEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!g_wakeEvent) {
+        Log(L"ERROR", L"cannot create wake event");
+        CloseHandle(hMutex);
         return 1;
     }
 
-    // --- global hotkey Ctrl+Alt+S ---------------------------------------
-    if (!RegisterHotKey(g_hwnd, 1, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'S'))
-        Log(L"RegisterHotKey(Ctrl+Alt+S) failed: " + std::to_wstring(GetLastError()));
-
-    // --- worker ----------------------------------------------------------
-    HANDLE hThread = CreateThread(NULL, 0, WorkerEntry, NULL, 0, NULL);
-    if (!hThread)
-    {
-        Log(L"CreateThread failed");
-        return 1;
+    if (!RegisterHotKey(g_msgWnd, 1, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'S')) {
+        Log(L"WARN", L"RegisterHotKey failed");
     }
 
-    // --- message loop ----------------------------------------------------
+    std::thread worker(WorkerThread);
+
     MSG msg;
-    while (GetMessageW(&msg, NULL, 0, 0))
-    {
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
 
-    // --- shutdown --------------------------------------------------------
     g_stop = true;
-    SetEvent(g_wake);
-    WaitForSingleObject(hThread, 30000);
+    if (g_wakeEvent) SetEvent(g_wakeEvent);
+    if (worker.joinable()) worker.join();
 
-    UnregisterHotKey(g_hwnd, 1);
-    CloseHandle(hThread);
-    CloseHandle(g_wake);
-    if (hMutex) CloseHandle(hMutex);
-
-    Log(L"==================== Agent stopped =====================");
+    UnregisterHotKey(g_msgWnd, 1);
+    if (g_wakeEvent) CloseHandle(g_wakeEvent);
+    CloseHandle(hMutex);
+    Log(L"INFO", L"agent stopped");
     return 0;
 }
