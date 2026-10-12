@@ -1,0 +1,41 @@
+steps:
+  # Checkout the repository
+  - name: Checkout repository
+    uses: actions/checkout@v4
+
+  # Set up the MSVC developer environment
+  - name: Set up MSVC dev environment
+    uses: ilammy/msvc-dev-cmd@v1
+    with:
+      arch: x64
+
+  # Compile main.cpp into a Windows x64 executable
+  - name: Compile main.cpp with MSVC
+    shell: cmd
+    run: |
+      cl.exe main.cpp ^
+        /std:c++17 ^
+        /O2 ^
+        /EHsc ^
+        /MT ^
+        /W4 ^
+        /DUNICODE /D_UNICODE ^
+        /Fe:vpnagent.exe ^
+        user32.lib shell32.lib wininet.lib advapi32.lib
+      if errorlevel 1 exit /b %errorlevel%
+
+  # Create the dist folder and place the executable in it
+  - name: Create dist folder and copy executable
+    shell: powershell
+    run: |
+      New-Item -ItemType Directory -Force -Path dist | Out-Null
+      Copy-Item -Path vpnagent.exe -Destination dist\
+
+  # Upload the built Windows executable as a downloadable artifact
+  - name: Upload Windows executable artifact
+    uses: actions/upload-artifact@v4
+    with:
+      name: vpnagent-windows-x64
+      path: dist/
+      retention-days: 14
+      if-no-files-found: error
