@@ -119,10 +119,18 @@ struct Config {
     int passes_before_pause = 2;
     int pause_minutes = 10;
     int max_size_kb = 256;
+
+    // Network management
+    std::string vpn_iface_prefix = "vpn_";     // interface = prefix + nic_name
+    std::string dhclient_path = "/sbin/dhclient";
+    int dhcp_timeout_sec = 20;
+    bool manage_routes = true;
+    bool manage_dns = true;
+    std::string dns_servers = "1.1.1.1 8.8.8.8"; // space-separated
+    int vpn_default_metric = 50;
 };
 
 namespace {
-
 std::mutex g_cfg_mutex;
 Config g_cfg;
 
@@ -130,12 +138,10 @@ Config get_config() {
     std::lock_guard<std::mutex> lk(g_cfg_mutex);
     return g_cfg;
 }
-
 void set_config(const Config& c) {
     std::lock_guard<std::mutex> lk(g_cfg_mutex);
     g_cfg = c;
 }
-
 } // namespace
 
 // ============================================================
@@ -183,6 +189,14 @@ int parse_int_kv(const std::string& val, int def, const std::string& key) {
     }
 }
 
+bool parse_bool_kv(const std::string& val, bool def) {
+    std::string v = val;
+    std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c){ return std::tolower(c); });
+    if (v == "1" || v == "true" || v == "yes" || v == "on") return true;
+    if (v == "0" || v == "false" || v == "no" || v == "off") return false;
+    return def;
+}
+
 void clamp_config(Config& cfg) {
     auto c = [](int& v, const char* name) {
         if (v < 1) {
@@ -200,6 +214,10 @@ void clamp_config(Config& cfg) {
     c(cfg.passes_before_pause, "passes_before_pause");
     c(cfg.pause_minutes, "pause_minutes");
     c(cfg.max_size_kb, "max_size_kb");
+    c(cfg.dhcp_timeout_sec, "dhcp_timeout_sec");
+    if (cfg.vpn_default_metric < 1 || cfg.vpn_default_metric > 4294967295LL) {
+        cfg.vpn_default_metric = 50;
+    }
 }
 
 void write_default_config(const std::string& path) {
@@ -232,7 +250,15 @@ void write_default_config(const std::string& path) {
          "passes_before_pause = 2\n"
          "pause_minutes = 10\n"
          "[log]\n"
-         "max_size_kb = 256\n";
+         "max_size_kb = 256\n"
+         "[network]\n"
+         "vpn_iface_prefix = vpn_\n"
+         "dhclient_path = /sbin/dhclient\n"
+         "dhcp_timeout_sec = 20\n"
+         "manage_routes = true\n"
+         "manage_dns = true\n"
+         "dns_servers = 1.1.1.1 8.8.8.8\n"
+         "vpn_default_metric = 50\n";
     f.flush();
 }
 
@@ -258,6 +284,13 @@ void apply_config_kv(Config& cfg, const std::string& key, const std::string& val
     else if (key == "passes_before_pause") cfg.passes_before_pause = parse_int_kv(val, cfg.passes_before_pause, key);
     else if (key == "pause_minutes") cfg.pause_minutes = parse_int_kv(val, cfg.pause_minutes, key);
     else if (key == "max_size_kb") cfg.max_size_kb = parse_int_kv(val, cfg.max_size_kb, key);
+    else if (key == "vpn_iface_prefix") cfg.vpn_iface_prefix = val;
+    else if (key == "dhclient_path") cfg.dhclient_path = val;
+    else if (key == "dhcp_timeout_sec") cfg.dhcp_timeout_sec = parse_int_kv(val, cfg.dhcp_timeout_sec, key);
+    else if (key == "manage_routes") cfg.manage_routes = parse_bool_kv(val, cfg.manage_routes);
+    else if (key == "manage_dns") cfg.manage_dns = parse_bool_kv(val, cfg.manage_dns);
+    else if (key == "dns_servers") cfg.dns_servers = val;
+    else if (key == "vpn_default_metric") cfg.vpn_default_metric = parse_int_kv(val, cfg.vpn_default_metric, key);
     else logger_write("WARN", "unknown config key: " + key);
 }
 
@@ -285,6 +318,271 @@ Config load_config(const std::string& path) {
             continue;
         }
         std::string k = trim(line.substr(0, eq));
+        std::string v = trim(line.substr(eq + 1));
+        apply_config_kv(cfg, k, v);
+    }
+    clamp_config(cfg);
+    return cfg;
+}
+
+} // namespace
+
+// ============================================================
+// Shared state
+// ============================================================
+namespace {
+
+std::atomic<bool> g_stop{false};
+std::atomic<bool> g_trigger{false};
+std::atomic<bool> g_reload_wake{false};
+std::atomic<bool> g_connected{false};
+std::atomic<bool> g_pass_running{false};
+
+std::mutex g_wait_mutex;
+std::condition_variable g_cv;
+
+struct StatusInfo {
+    std::mutex mtx;
+    std::string state = "disconnected";
+    std::string ip_port = "-";
+};
+StatusInfo g_status;
+
+void wake_worker() { g_cv.notify_all(); }
+
+void set_status(const std::string& state, const std::string& ip_port) {
+    std::lock_guard<std::mutex> lk(g_status.mtx);
+    g_status.state = state;
+    g_status.ip_port = ip_port;
+}
+void set_status_state(const std::string& state) {
+    std::lock_guard<std::mutex> lk(g_status.mtx);
+    g_status.state = state;
+}
+void set_status_ip_port(const std::string& ip_port) {
+    std::lock_guard<std::mutex> lk(g_status.mtx);
+    g_status.ip_port = ip_port;
+}
+
+enum class WaitReason { Timeout, Stop, Trigger, Reload };
+
+WaitReason wait_with_wake(int seconds) {
+    std::unique_lock<std::mutex> lk(g_wait_mutex);
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+    for (;;) {
+        if (g_stop.load()) return WaitReason::Stop;
+        if (g_trigger.load()) return WaitReason::Trigger;
+        if (g_reload_wake.load()) return WaitReason::Reload;
+        if (std::chrono::steady_clock::now() >= deadline) return WaitReason::Timeout;
+        g_cv.wait_until(lk, deadline);
+    }
+}
+
+} // namespace
+
+// ============================================================
+// Config reload
+// ============================================================
+namespace {
+
+void do_reload_config() {
+    Config newcfg = load_config(CONFIG_PATH);
+    set_config(newcfg);
+    {
+        std::lock_guard<std::mutex> lk(g_log_mutex);
+        g_log_file = newcfg.log_file;
+        g_log_max_kb = newcfg.max_size_kb;
+    }
+    logger_write("INFO", "config reloaded");
+}
+
+void request_reload() {
+    do_reload_config();
+    g_reload_wake.store(true);
+    wake_worker();
+}
+
+} // namespace
+
+// ============================================================
+// Base64 decoder
+// ============================================================
+namespace {
+
+std::string base64_decode(const std::string& in) {
+    auto val = [](char c) -> int {
+        if (c >= 'A' && c <= 'Z') return c - 'A';
+        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+        if (c >= '0' && c <= '9') return c - '0' + 52;
+        if (c == '+') return 62;
+        if (c == '/') return 63;
+        return -1;
+    };
+    std::string out;
+    out.reserve(in.size() * 3 / 4 + 4);
+    uint32_t accum = 0;
+    int bits = 0;
+    for (char ch : in) {
+        if (ch == '=') break;
+        if (ch == '\n' || ch == '\r' || ch == ' ' || ch == '\t') continue;
+        int v = val(ch);
+        if (v < 0) continue;
+        accum = ((accum << 6) | (uint32_t)v) & 0xFFFFFFu;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back((char)((accum >> bits) & 0xFFu));
+        }
+    }
+    return out;
+}
+
+} // namespace
+
+// ============================================================
+// CURL helpers
+// ============================================================
+namespace {
+
+class CurlHandle {
+public:
+    CurlHandle() : h_(curl_easy_init()) {}
+    ~CurlHandle() { if (h_) curl_easy_cleanup(h_); }
+    CurlHandle(const CurlHandle&) = delete;
+    CurlHandle& operator=(const CurlHandle&) = delete;
+    CURL* get() const { return h_; }
+    explicit operator bool() const { return h_ != nullptr; }
+private:
+    CURL* h_;
+};
+
+size_t curl_write_cb(char* ptr, size_t size, size_t nmemb, void* userdata) {
+    std::string* out = static_cast<std::string*>(userdata);
+    out->append(ptr, size * nmemb);
+    return size * nmemb;
+}
+
+bool curl_download(const std::string& url, int timeout_sec, std::string& out) {
+    CurlHandle h;
+    if (!h) return false;
+    curl_easy_setopt(h.get(), CURLOPT_URL, url.c_str());
+    curl_easy_setopt(h.get(), CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(h.get(), CURLOPT_TIMEOUT, (long)timeout_sec);
+    curl_easy_setopt(h.get(), CURLOPT_CONNECTTIMEOUT, (long)timeout_sec);
+    curl_easy_setopt(h.get(), CURLOPT_WRITEFUNCTION, curl_write_cb);
+    curl_easy_setopt(h.get(), CURLOPT_WRITEDATA, &out);
+    curl_easy_setopt(h.get(), CURLOPT_USERAGENT, "vpnagent/1.0");
+    CURLcode rc = curl_easy_perform(h.get());
+    if (rc != CURLE_OK) return false;
+    long code = 0;
+    curl_easy_getinfo(h.get(), CURLINFO_RESPONSE_CODE, &code);
+    return code == 200;
+}
+
+bool curl_head(const std::string& url, int timeout_sec) {
+    CurlHandle h;
+    if (!h) return false;
+    curl_easy_setopt(h.get(), CURLOPT_URL, url.c_str());
+    curl_easy_setopt(h.get(), CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(h.get(), CURLOPT_TIMEOUT, (long)timeout_sec);
+    curl_easy_setopt(h.get(), CURLOPT_CONNECTTIMEOUT, (long)timeout_sec);
+    curl_easy_setopt(h.get(), CURLOPT_NOBODY, 1L);
+    curl_easy_setopt(h.get(), CURLOPT_USERAGENT, "vpnagent/1.0");
+    CURLcode rc = curl_easy_perform(h.get());
+    if (rc != CURLE_OK) return false;
+    long code = 0;
+    curl_easy_getinfo(h.get(), CURLINFO_RESPONSE_CODE, &code);
+    return code >= 200 && code < 400;
+}
+
+} // namespace
+
+// ============================================================
+// CSV parsing
+// ============================================================
+struct ServerEntry {
+    std::string host;
+    std::string ip;
+    int port = 443;
+};
+
+namespace {
+
+std::vector<std::string> parse_csv_line(const std::string& line) {
+    std::vector<std::string> fields;
+    std::string cur;
+    bool in_quotes = false;
+    for (size_t i = 0; i < line.size(); ++i) {
+        char c = line[i];
+        if (in_quotes) {
+            if (c == '"') {
+                if (i + 1 < line.size() && line[i + 1] == '"') {
+                    cur.push_back('"');
+                    ++i;
+                } else {
+                    in_quotes = false;
+                }
+            } else {
+                cur.push_back(c);
+            }
+        } else {
+            if (c == '"') in_quotes = true;
+            else if (c == ',') { fields.push_back(cur); cur.clear(); }
+            else cur.push_back(c);
+        }
+    }
+    fields.push_back(cur);
+    return fields;
+}
+
+int parse_port_from_ovpn(const std::string& conf) {
+    std::istringstream iss(conf);
+    std::string line;
+    while (std::getline(iss, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.compare(0, 7, "remote ") == 0) {
+            std::istringstream ls(line.substr(7));
+            std::string ip, port_str;
+            ls >> ip >> port_str;
+            if (port_str.empty()) break;
+            auto slash = port_str.find('/');
+            if (slash != std::string::npos) port_str = port_str.substr(0, slash);
+            try {
+                int p = std::stoi(port_str);
+                if (p > 0 && p <= 65535) return p;
+            } catch (...) { /* fallthrough */ }
+            break;
+        }
+    }
+    return 443;
+}
+
+std::vector<ServerEntry> parse_csv(const std::string& text) {
+    std::vector<ServerEntry> out;
+    std::istringstream iss(text);
+    std::string line;
+    bool header_seen = false;
+    while (std::getline(iss, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty()) continue;
+        if (line[0] == '*') continue;
+        if (!header_seen) {
+            if (line[0] == '#') { header_seen = true; continue; }
+            header_seen = true;
+        }
+        auto fields = parse_csv_line(line);
+        if (fields.size() < 2) continue;
+        std::string host = fields[0];
+        std::string ip = trim(fields[1]);
+        if (ip.empty()) continue;
+        int port = 443;
+        if (fields.size() > 14) {
+            int p = parse_port_from_ovpn(base64_decode(fields[14]));
+            if (p > 0 && p <= 65535) port = p;
+        }
+        ServerEntry e;
+        e.host = host;
+   str(0, eq));
         std::string v = trim(line.substr(eq + 1));
         apply_config_kv(cfg, k, v);
     }
