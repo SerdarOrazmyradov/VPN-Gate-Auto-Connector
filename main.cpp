@@ -582,275 +582,6 @@ std::vector<ServerEntry> parse_csv(const std::string& text) {
         }
         ServerEntry e;
         e.host = host;
-   str(0, eq));
-        std::string v = trim(line.substr(eq + 1));
-        apply_config_kv(cfg, k, v);
-    }
-    clamp_config(cfg);
-    return cfg;
-}
-
-} // namespace
-
-// ============================================================
-// Shared state
-// ============================================================
-namespace {
-
-std::atomic<bool> g_stop{false};
-std::atomic<bool> g_trigger{false};
-std::atomic<bool> g_reload_wake{false};
-std::atomic<bool> g_connected{false};
-std::atomic<bool> g_pass_running{false};
-
-std::mutex g_wait_mutex;
-std::condition_variable g_cv;
-
-struct StatusInfo {
-    std::mutex mtx;
-    std::string state = "disconnected";
-    std::string ip_port = "-";
-};
-StatusInfo g_status;
-
-void wake_worker() {
-    g_cv.notify_all();
-}
-
-void set_status(const std::string& state, const std::string& ip_port) {
-    std::lock_guard<std::mutex> lk(g_status.mtx);
-    g_status.state = state;
-    g_status.ip_port = ip_port;
-}
-
-void set_status_state(const std::string& state) {
-    std::lock_guard<std::mutex> lk(g_status.mtx);
-    g_status.state = state;
-}
-
-void set_status_ip_port(const std::string& ip_port) {
-    std::lock_guard<std::mutex> lk(g_status.mtx);
-    g_status.ip_port = ip_port;
-}
-
-enum class WaitReason { Timeout, Stop, Trigger, Reload };
-
-WaitReason wait_with_wake(int seconds) {
-    std::unique_lock<std::mutex> lk(g_wait_mutex);
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
-    for (;;) {
-        if (g_stop.load()) return WaitReason::Stop;
-        if (g_trigger.load()) return WaitReason::Trigger;
-        if (g_reload_wake.load()) return WaitReason::Reload;
-        if (std::chrono::steady_clock::now() >= deadline) return WaitReason::Timeout;
-        g_cv.wait_until(lk, deadline);
-    }
-}
-
-} // namespace
-
-// ============================================================
-// Config reload
-// ============================================================
-namespace {
-
-void do_reload_config() {
-    Config newcfg = load_config(CONFIG_PATH);
-    set_config(newcfg);
-    {
-        std::lock_guard<std::mutex> lk(g_log_mutex);
-        g_log_file = newcfg.log_file;
-        g_log_max_kb = newcfg.max_size_kb;
-    }
-    logger_write("INFO", "config reloaded");
-}
-
-void request_reload() {
-    do_reload_config();
-    g_reload_wake.store(true);
-    wake_worker();
-}
-
-} // namespace
-
-// ============================================================
-// Base64 decoder
-// ============================================================
-namespace {
-
-std::string base64_decode(const std::string& in) {
-    auto val = [](char c) -> int {
-        if (c >= 'A' && c <= 'Z') return c - 'A';
-        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
-        if (c >= '0' && c <= '9') return c - '0' + 52;
-        if (c == '+') return 62;
-        if (c == '/') return 63;
-        return -1;
-    };
-    std::string out;
-    out.reserve(in.size() * 3 / 4 + 4);
-    uint32_t accum = 0;
-    int bits = 0;
-    for (char ch : in) {
-        if (ch == '=') break;
-        if (ch == '\n' || ch == '\r' || ch == ' ' || ch == '\t') continue;
-        int v = val(ch);
-        if (v < 0) continue;
-        accum = ((accum << 6) | (uint32_t)v) & 0xFFFFFFu;
-        bits += 6;
-        if (bits >= 8) {
-            bits -= 8;
-            out.push_back((char)((accum >> bits) & 0xFFu));
-        }
-    }
-    return out;
-}
-
-} // namespace
-
-// ============================================================
-// CURL helpers
-// ============================================================
-namespace {
-
-class CurlHandle {
-public:
-    CurlHandle() : h_(curl_easy_init()) {}
-    ~CurlHandle() { if (h_) curl_easy_cleanup(h_); }
-    CurlHandle(const CurlHandle&) = delete;
-    CurlHandle& operator=(const CurlHandle&) = delete;
-    CURL* get() const { return h_; }
-    explicit operator bool() const { return h_ != nullptr; }
-private:
-    CURL* h_;
-};
-
-size_t curl_write_cb(char* ptr, size_t size, size_t nmemb, void* userdata) {
-    std::string* out = static_cast<std::string*>(userdata);
-    out->append(ptr, size * nmemb);
-    return size * nmemb;
-}
-
-bool curl_download(const std::string& url, int timeout_sec, std::string& out) {
-    CurlHandle h;
-    if (!h) return false;
-    curl_easy_setopt(h.get(), CURLOPT_URL, url.c_str());
-    curl_easy_setopt(h.get(), CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(h.get(), CURLOPT_TIMEOUT, (long)timeout_sec);
-    curl_easy_setopt(h.get(), CURLOPT_CONNECTTIMEOUT, (long)timeout_sec);
-    curl_easy_setopt(h.get(), CURLOPT_WRITEFUNCTION, curl_write_cb);
-    curl_easy_setopt(h.get(), CURLOPT_WRITEDATA, &out);
-    curl_easy_setopt(h.get(), CURLOPT_USERAGENT, "vpnagent/1.0");
-    CURLcode rc = curl_easy_perform(h.get());
-    if (rc != CURLE_OK) return false;
-    long code = 0;
-    curl_easy_getinfo(h.get(), CURLINFO_RESPONSE_CODE, &code);
-    return code == 200;
-}
-
-bool curl_head(const std::string& url, int timeout_sec) {
-    CurlHandle h;
-    if (!h) return false;
-    curl_easy_setopt(h.get(), CURLOPT_URL, url.c_str());
-    curl_easy_setopt(h.get(), CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(h.get(), CURLOPT_TIMEOUT, (long)timeout_sec);
-    curl_easy_setopt(h.get(), CURLOPT_CONNECTTIMEOUT, (long)timeout_sec);
-    curl_easy_setopt(h.get(), CURLOPT_NOBODY, 1L);
-    curl_easy_setopt(h.get(), CURLOPT_USERAGENT, "vpnagent/1.0");
-    CURLcode rc = curl_easy_perform(h.get());
-    if (rc != CURLE_OK) return false;
-    long code = 0;
-    curl_easy_getinfo(h.get(), CURLINFO_RESPONSE_CODE, &code);
-    return code >= 200 && code < 400;
-}
-
-} // namespace
-
-// ============================================================
-// CSV parsing
-// ============================================================
-struct ServerEntry {
-    std::string host;
-    std::string ip;
-    int port = 443;
-};
-
-namespace {
-
-std::vector<std::string> parse_csv_line(const std::string& line) {
-    std::vector<std::string> fields;
-    std::string cur;
-    bool in_quotes = false;
-    for (size_t i = 0; i < line.size(); ++i) {
-        char c = line[i];
-        if (in_quotes) {
-            if (c == '"') {
-                if (i + 1 < line.size() && line[i + 1] == '"') {
-                    cur.push_back('"');
-                    ++i;
-                } else {
-                    in_quotes = false;
-                }
-            } else {
-                cur.push_back(c);
-            }
-        } else {
-            if (c == '"') in_quotes = true;
-            else if (c == ',') { fields.push_back(cur); cur.clear(); }
-            else cur.push_back(c);
-        }
-    }
-    fields.push_back(cur);
-    return fields;
-}
-
-int parse_port_from_ovpn(const std::string& conf) {
-    std::istringstream iss(conf);
-    std::string line;
-    while (std::getline(iss, line)) {
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        if (line.compare(0, 7, "remote ") == 0) {
-            std::istringstream ls(line.substr(7));
-            std::string ip, port_str;
-            ls >> ip >> port_str;
-            if (port_str.empty()) break;
-            auto slash = port_str.find('/');
-            if (slash != std::string::npos) port_str = port_str.substr(0, slash);
-            try {
-                int p = std::stoi(port_str);
-                if (p > 0 && p <= 65535) return p;
-            } catch (...) { /* fallthrough */ }
-            break;
-        }
-    }
-    return 443;
-}
-
-std::vector<ServerEntry> parse_csv(const std::string& text) {
-    std::vector<ServerEntry> out;
-    std::istringstream iss(text);
-    std::string line;
-    bool header_seen = false;
-    while (std::getline(iss, line)) {
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        if (line.empty()) continue;
-        if (line[0] == '*') continue;
-        if (!header_seen) {
-            if (line[0] == '#') { header_seen = true; continue; }
-            header_seen = true;
-        }
-        auto fields = parse_csv_line(line);
-        if (fields.size() < 2) continue;
-        std::string host = fields[0];
-        std::string ip = trim(fields[1]);
-        if (ip.empty()) continue;
-        int port = 443;
-        if (fields.size() > 14) {
-            int p = parse_port_from_ovpn(base64_decode(fields[14]));
-            if (p > 0 && p <= 65535) port = p;
-        }
-        ServerEntry e;
-        e.host = host;
         e.ip = ip;
         e.port = port;
         out.push_back(std::move(e));
@@ -889,9 +620,9 @@ bool write_state(const std::string& path, int idx) {
 } // namespace
 
 // ============================================================
-// vpncmd execution
+// Generic command runner (safe, no shell)
 // ============================================================
-struct VpnCmdResult {
+struct CmdResult {
     int exit_code = -1;
     std::string output;
     bool timed_out = false;
@@ -899,18 +630,13 @@ struct VpnCmdResult {
 
 namespace {
 
-VpnCmdResult run_vpncmd(const Config& cfg, const std::vector<std::string>& cmd_args) {
-    VpnCmdResult res;
-    std::vector<std::string> args;
-    args.push_back(cfg.vpncmd_path);
-    args.push_back("localhost");
-    args.push_back("/CLIENT");
-    args.push_back("/CMD");
-    for (const auto& a : cmd_args) args.push_back(a);
+CmdResult run_cmd(const std::vector<std::string>& args, int timeout_sec) {
+    CmdResult res;
+    if (args.empty()) return res;
 
     std::vector<char*> argv;
     argv.reserve(args.size() + 1);
-    for (auto& s : args) argv.push_back(const_cast<char*>(s.c_str()));
+    for (const auto& s : args) argv.push_back(const_cast<char*>(s.c_str()));
     argv.push_back(nullptr);
 
     int pipefd[2];
@@ -940,7 +666,7 @@ VpnCmdResult run_vpncmd(const Config& cfg, const std::vector<std::string>& cmd_a
     for (;;) {
         auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - start).count();
-        long long remaining = (long long)cfg.vpncmd_call_timeout_sec * 1000 - elapsed_ms;
+        long long remaining = (long long)timeout_sec * 1000 - elapsed_ms;
         if (remaining <= 0) { timed_out = true; break; }
         struct pollfd pfd;
         pfd.fd = pipefd[0];
@@ -962,9 +688,7 @@ VpnCmdResult run_vpncmd(const Config& cfg, const std::vector<std::string>& cmd_a
         if (out.size() > 1024 * 1024) break;
     }
 
-    if (timed_out) {
-        kill(pid, SIGKILL);
-    }
+    if (timed_out) kill(pid, SIGKILL);
 
     int status = 0;
     waitpid(pid, &status, 0);
@@ -983,6 +707,35 @@ VpnCmdResult run_vpncmd(const Config& cfg, const std::vector<std::string>& cmd_a
     if (WIFEXITED(status)) res.exit_code = WEXITSTATUS(status);
     else if (WIFSIGNALED(status)) res.exit_code = 128 + WTERMSIG(status);
     res.output = std::move(out);
+    return res;
+}
+
+} // namespace
+
+// ============================================================
+// vpncmd execution (now built on run_cmd)
+// ============================================================
+struct VpnCmdResult {
+    int exit_code = -1;
+    std::string output;
+    bool timed_out = false;
+};
+
+namespace {
+
+VpnCmdResult run_vpncmd(const Config& cfg, const std::vector<std::string>& cmd_args) {
+    std::vector<std::string> args;
+    args.push_back(cfg.vpncmd_path);
+    args.push_back("localhost");
+    args.push_back("/CLIENT");
+    args.push_back("/CMD");
+    for (const auto& a : cmd_args) args.push_back(a);
+
+    auto r = run_cmd(args, cfg.vpncmd_call_timeout_sec);
+    VpnCmdResult res;
+    res.exit_code = r.exit_code;
+    res.output = std::move(r.output);
+    res.timed_out = r.timed_out;
     return res;
 }
 
@@ -1062,6 +815,416 @@ bool account_matches(const std::string& output, const ServerEntry& srv) {
 } // namespace
 
 // ============================================================
+// Network Manager (routing / DHCP / DNS lifecycle)
+// ============================================================
+namespace {
+
+struct RouteInfo {
+    bool valid = false;
+    std::string gw;
+    std::string dev;
+    int metric = -1;
+};
+
+RouteInfo parse_first_default_route(const std::string& output) {
+    RouteInfo ri;
+    std::istringstream iss(output);
+    std::string line;
+    while (std::getline(iss, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.compare(0, 8, "default ") != 0) continue;
+        ri.valid = true;
+        std::istringstream ls(line.substr(8));
+        std::string tok;
+        while (ls >> tok) {
+            if (tok == "via") { ls >> ri.gw; }
+            else if (tok == "dev") { ls >> ri.dev; }
+            else if (tok == "metric") {
+                std::string m; ls >> m;
+                try { ri.metric = std::stoi(m); } catch (...) {}
+            }
+        }
+        return ri;
+    }
+    return ri;
+}
+
+RouteInfo parse_default_route_for_dev(const std::string& output, const std::string& dev) {
+    RouteInfo ri;
+    std::istringstream iss(output);
+    std::string line;
+    while (std::getline(iss, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.compare(0, 8, "default ") != 0) continue;
+        RouteInfo cand;
+        cand.valid = true;
+        std::istringstream ls(line.substr(8));
+        std::string tok;
+        while (ls >> tok) {
+            if (tok == "via") { ls >> cand.gw; }
+            else if (tok == "dev") { ls >> cand.dev; }
+            else if (tok == "metric") {
+                std::string m; ls >> m;
+                try { cand.metric = std::stoi(m); } catch (...) {}
+            }
+        }
+        if (cand.dev == dev) return cand;
+    }
+    return ri;
+}
+
+bool iface_has_ipv4(const std::string& iface) {
+    auto r = run_cmd({"ip", "-4", "-o", "addr", "show", "dev", iface}, 5);
+    return r.exit_code == 0 && r.output.find(" inet ") != std::string::npos;
+}
+
+class NetworkManager {
+public:
+    NetworkManager() = default;
+    ~NetworkManager() { cleanup(); }
+    NetworkManager(const NetworkManager&) = delete;
+    NetworkManager& operator=(const NetworkManager&) = delete;
+
+    bool is_active() const { return active_; }
+    std::string iface() const { return iface_; }
+    std::string vpn_gw() const { return vpn_gw_; }
+
+    // Public entry point: bring up VPN interface, DHCP, host route, default route, DNS.
+    bool setup(const Config& cfg, const std::string& server_ip) {
+        // Ensure clean slate
+        cleanup();
+
+        iface_ = cfg.vpn_iface_prefix + cfg.nic_name;
+        server_ip_ = server_ip;
+
+        if (!capture_original_state()) {
+            logger_write("WARN", "net: cannot capture original routing state, "
+                                 "VPN will run without full route management");
+        }
+
+        // 1. bring interface up
+        {
+            auto r = run_cmd({"ip", "link", "set", "dev", iface_, "up"}, 10);
+            if (r.exit_code != 0) {
+                logger_write("ERROR", "net: failed to bring " + iface_ + " up: " +
+                             first_meaningful_lines(r.output, 2));
+                return false;
+            }
+            logger_write("INFO", "net: " + iface_ + " set up");
+        }
+
+        // 2. host route to VPN server via original gateway (before we touch the default)
+        if (cfg.manage_routes && original_.valid &&
+            !original_.gw.empty() && !original_.dev.empty()) {
+            std::string host = server_ip_ + "/32";
+            auto r = run_cmd({"ip", "route", "add", host,
+                              "via", original_.gw, "dev", original_.dev}, 10);
+            if (r.exit_code == 0) {
+                host_route_added_ = true;
+                logger_write("INFO", "net: host route " + host + " via " +
+                             original_.gw + " dev " + original_.dev);
+            } else if (r.output.find("File exists") == std::string::npos) {
+                logger_write("WARN", "net: host route to server failed: " +
+                             first_meaningful_lines(r.output, 2));
+            } else {
+                host_route_added_ = true; // already present; we own it now
+            }
+        } else if (cfg.manage_routes) {
+            logger_write("WARN", "net: no original default route captured; "
+                                 "skipping host route (server reachability may be fragile)");
+        }
+
+        // 3. remove original default (we'll put it back on cleanup)
+        if (cfg.manage_routes && original_.valid && !original_.gw.empty() && !original_.dev.empty()) {
+            auto r = run_cmd({"ip", "route", "del", "default",
+                              "via", original_.gw, "dev", original_.dev}, 10);
+            if (r.exit_code == 0) {
+                original_default_removed_ = true;
+                logger_write("INFO", "net: original default route removed");
+            }
+        }
+
+        // 4. run dhclient to obtain IPv4 lease on the VPN interface
+        if (!run_dhcp(cfg)) {
+            return false;
+        }
+
+        // 5. verify we actually got an IP
+        if (!iface_has_ipv4(iface_)) {
+            logger_write("ERROR", "net: no IPv4 address on " + iface_ + " after DHCP");
+            return false;
+        }
+
+        // 6. install default route via VPN, delete any dhclient-provided defaults via iface
+        if (cfg.manage_routes) {
+            if (!install_vpn_default(cfg)) {
+                return false;
+            }
+        }
+
+        // 7. DNS (optional)
+        if (cfg.manage_dns) {
+            setup_dns(cfg);
+        }
+
+        active_ = true;
+        logger_write("INFO", "net: VPN network setup complete on " + iface_ +
+                     (vpn_gw_.empty() ? "" : " (gw " + vpn_gw_ + ")"));
+        return true;
+    }
+
+    // Public entry: release DHCP, restore routes, restore DNS, flush IPs.
+    void cleanup() {
+        if (!active_ && iface_.empty() && !host_route_added_ &&
+            !original_default_removed_ && !dhcp_started_) {
+            return; // nothing to do
+        }
+
+        const Config cfg = get_config();
+        const std::string iface = iface_.empty()
+            ? (cfg.vpn_iface_prefix + cfg.nic_name)
+            : iface_;
+
+        // 1. release DHCP lease (best effort)
+        if (dhcp_started_ || !lease_file_.empty()) {
+            std::vector<std::string> rel = {cfg.dhclient_path, "-4", "-r"};
+            if (!pid_file_.empty()) { rel.push_back("-pf"); rel.push_back(pid_file_); }
+            if (!lease_file_.empty()) { rel.push_back("-lf"); rel.push_back(lease_file_); }
+            rel.push_back(iface);
+            auto r = run_cmd(rel, 15);
+            logger_write("INFO", "net: dhclient release rc=" +
+                         std::to_string(r.exit_code));
+            dhcp_started_ = false;
+        }
+
+        // 2. flush addresses on the interface
+        {
+            auto r = run_cmd({"ip", "addr", "flush", "dev", iface}, 10);
+            (void)r;
+            logger_write("INFO", "net: flushed addresses on " + iface);
+        }
+
+        // 3. flush remaining routes on the interface
+        {
+            auto r = run_cmd({"ip", "route", "flush", "dev", iface}, 10);
+            (void)r;
+            logger_write("INFO", "net: flushed routes on " + iface);
+        }
+        vpn_gw_.clear();
+
+        // 4. restore original default route
+        if (original_default_removed_ && original_.valid &&
+            !original_.gw.empty() && !original_.dev.empty()) {
+            std::vector<std::string> add = {"ip", "route", "add", "default",
+                                            "via", original_.gw, "dev", original_.dev};
+            if (original_.metric >= 0) {
+                add.push_back("metric");
+                add.push_back(std::to_string(original_.metric));
+            }
+            auto r = run_cmd(add, 10);
+            if (r.exit_code == 0) {
+                logger_write("INFO", "net: original default route restored");
+            } else {
+                logger_write("WARN", "net: restore default route failed: " +
+                             first_meaningful_lines(r.output, 2));
+            }
+            original_default_removed_ = false;
+        }
+
+        // 5. remove host route to VPN server
+        if (host_route_added_ && !server_ip_.empty()) {
+            std::string host = server_ip_ + "/32";
+            auto r = run_cmd({"ip", "route", "del", host}, 10);
+            if (r.exit_code == 0) {
+                logger_write("INFO", "net: host route to server removed");
+            }
+            host_route_added_ = false;
+        }
+
+        // 6. restore DNS
+        restore_dns();
+
+        active_ = false;
+    }
+
+private:
+    bool capture_original_state() {
+        auto r = run_cmd({"ip", "-4", "route", "show", "default"}, 5);
+        if (r.exit_code != 0) return false;
+        original_ = parse_first_default_route(r.output);
+        if (original_.valid) {
+            logger_write("INFO", "net: original default gw=" +
+                         (original_.gw.empty() ? std::string("<none>") : original_.gw) +
+                         " dev=" + original_.dev +
+                         (original_.metric >= 0
+                             ? " metric=" + std::to_string(original_.metric)
+                             : ""));
+        }
+        return original_.valid;
+    }
+
+    bool run_dhcp(const Config& cfg) {
+        if (access(cfg.dhclient_path.c_str(), X_OK) != 0) {
+            logger_write("ERROR", "net: dhclient not executable: " + cfg.dhclient_path);
+            return false;
+        }
+
+        pid_file_ = "/var/run/vpnagent-dhclient-" + cfg.nic_name + ".pid";
+        lease_file_ = "/var/lib/vpnagent/dhclient-" + cfg.nic_name + ".lease";
+        mkdirs_for_file(lease_file_);
+
+        logger_write("INFO", "net: running dhclient on " + iface_);
+        std::vector<std::string> args = {
+            cfg.dhclient_path, "-4", "-1",
+            "-pf", pid_file_,
+            "-lf", lease_file_,
+            iface_
+        };
+        auto r = run_cmd(args, cfg.dhcp_timeout_sec);
+        dhcp_started_ = true;
+        if (r.timed_out) {
+            logger_write("ERROR", "net: dhclient timed out on " + iface_);
+            return false;
+        }
+        if (r.exit_code != 0) {
+            logger_write("ERROR", "net: dhclient failed on " + iface_ +
+                         " rc=" + std::to_string(r.exit_code) +
+                         " " + first_meaningful_lines(r.output, 3));
+            return false;
+        }
+        logger_write("INFO", "net: dhclient acquired lease on " + iface_);
+        return true;
+    }
+
+    bool install_vpn_default(const Config& cfg) {
+        // Discover whether dhclient installed a default route via our iface
+        RouteInfo dhcp_default;
+        {
+            auto r = run_cmd({"ip", "-4", "route", "show", "default"}, 5);
+            if (r.exit_code == 0) {
+                dhcp_default = parse_default_route_for_dev(r.output, iface_);
+            }
+        }
+        if (dhcp_default.valid) {
+            vpn_gw_ = dhcp_default.gw; // may be empty for p2p TAP
+        }
+
+        // Drop any default routes dhclient installed on this iface so we own them
+        {
+            auto r = run_cmd({"ip", "route", "flush", "default", "dev", iface_}, 10);
+            (void)r;
+        }
+
+        std::vector<std::string> add = {"ip", "route", "add", "default"};
+        if (!vpn_gw_.empty()) {
+            add.push_back("via");   add.push_back(vpn_gw_);
+        }
+        add.push_back("dev");       add.push_back(iface_);
+        add.push_back("metric");    add.push_back(std::to_string(cfg.vpn_default_metric));
+
+        auto r = run_cmd(add, 10);
+        if (r.exit_code != 0) {
+            logger_write("ERROR", "net: failed to install VPN default route: " +
+                         first_meaningful_lines(r.output, 2));
+            return false;
+        }
+        logger_write("INFO", "net: default route installed via " +
+                     (vpn_gw_.empty() ? iface_ : (vpn_gw_ + " dev " + iface_)) +
+                     " metric " + std::to_string(cfg.vpn_default_metric));
+        return true;
+    }
+
+    void setup_dns(const Config& cfg) {
+        const std::string resolv = "/etc/resolv.conf";
+        struct stat lst;
+        if (lstat(resolv.c_str(), &lst) != 0) return;
+        if (S_ISLNK(lst.st_mode)) {
+            logger_write("WARN", "net: /etc/resolv.conf is a symlink "
+                                 "(likely systemd-resolved); skipping DNS management");
+            return;
+        }
+
+        std::string current;
+        {
+            std::ifstream f(resolv);
+            if (f) {
+                std::stringstream ss; ss << f.rdbuf();
+                current = ss.str();
+            }
+        }
+
+        if (!dns_backed_up_) {
+            dns_backup_ = "/etc/resolv.conf.vpnagent.bak";
+            std::ofstream b(dns_backup_, std::ios::trunc);
+            if (b) { b << current; b.flush(); dns_backed_up_ = true; }
+        }
+
+        // Write nameserver lines followed by the original content (so user
+        // specific settings aren't lost, but our nameservers take precedence).
+        std::ofstream f(resolv, std::ios::trunc);
+        if (!f) {
+            logger_write("WARN", "net: cannot write /etc/resolv.conf");
+            return;
+        }
+        std::istringstream ss(cfg.dns_servers);
+        std::string ns;
+        while (ss >> ns) {
+            f << "nameserver " << ns << "\n";
+        }
+        f << current;
+        f.flush();
+        dns_modified_ = true;
+        logger_write("INFO", "net: DNS configured with: " + cfg.dns_servers);
+    }
+
+    void restore_dns() {
+        if (!dns_modified_) return;
+        const std::string resolv = "/etc/resolv.conf";
+        const std::string bak = dns_backup_.empty()
+            ? std::string("/etc/resolv.conf.vpnagent.bak")
+            : dns_backup_;
+        if (file_exists(bak)) {
+            // Copy contents back (avoid rename in case of bind mounts)
+            std::ifstream in(bak);
+            std::ofstream out(resolv, std::ios::trunc);
+            if (in && out) {
+                out << in.rdbuf();
+                out.flush();
+                logger_write("INFO", "net: /etc/resolv.conf restored");
+            } else {
+                logger_write("WARN", "net: failed to restore /etc/resolv.conf");
+            }
+            unlink(bak.c_str());
+        }
+        dns_modified_ = false;
+        dns_backed_up_ = false;
+        dns_backup_.clear();
+    }
+
+    bool active_ = false;
+    std::string iface_;
+    std::string server_ip_;
+    std::string vpn_gw_;
+
+    RouteInfo original_;
+    bool host_route_added_ = false;
+    bool original_default_removed_ = false;
+
+    bool dhcp_started_ = false;
+    std::string pid_file_;
+    std::string lease_file_;
+
+    bool dns_modified_ = false;
+    bool dns_backed_up_ = false;
+    std::string dns_backup_;
+};
+
+// Single global instance (only touched by worker thread and its children).
+NetworkManager g_netmgr;
+
+} // namespace
+
+// ============================================================
 // Server attempt
 // ============================================================
 namespace {
@@ -1081,6 +1244,9 @@ void log_attempt(int index, const std::string& server_str, const std::string& re
 ServerResult try_server(const Config& cfg, const ServerEntry& srv, int index) {
     std::string server_str = srv.ip + ":" + std::to_string(srv.port);
     auto t0 = std::chrono::steady_clock::now();
+
+    // Always start from a clean network state
+    g_netmgr.cleanup();
 
     run_vpncmd(cfg, {"AccountDisconnect", cfg.account_name});
     if (g_stop.load()) return ServerResult::SetFailed;
@@ -1144,6 +1310,16 @@ ServerResult try_server(const Config& cfg, const ServerEntry& srv, int index) {
         if (!st.timed_out) {
             std::string status = extract_session_status(st.output);
             if (status.find("Session Established") != std::string::npos) {
+                // ---- Network bring-up (DHCP + routes + DNS) ----
+                logger_write("INFO", "net: bringing up VPN network for " + server_str);
+                if (!g_netmgr.setup(cfg, srv.ip)) {
+                    logger_write("ERROR", "net: setup failed for " + server_str +
+                                 "; rolling back and trying next server");
+                    g_netmgr.cleanup();
+                    run_vpncmd(cfg, {"AccountDisconnect", cfg.account_name});
+                    log_attempt(index, server_str, "network-failed", t0, "");
+                    return ServerResult::SetFailed;
+                }
                 log_attempt(index, server_str, "success", t0, "");
                 return ServerResult::Success;
             }
@@ -1287,6 +1463,9 @@ bool run_pass_from(const Config& cfg, std::vector<ServerEntry>& servers, int sta
             return true;
         }
 
+        // Any failure means we must ensure network state is clean before next attempt
+        g_netmgr.cleanup();
+
         write_state(cfg.state_file, i + 1);
     }
     set_status("disconnected", "-");
@@ -1298,6 +1477,7 @@ void do_keepalive(const Config& cfg) {
     if (r == WaitReason::Stop) return;
     if (r == WaitReason::Trigger) {
         g_trigger.store(false);
+        g_netmgr.cleanup();
         g_connected.store(false);
         logger_write("INFO", "keep-alive: trigger, reconnecting");
         return;
@@ -1311,6 +1491,7 @@ void do_keepalive(const Config& cfg) {
     std::string status = extract_session_status(res.output);
     if (status.find("Session Established") == std::string::npos) {
         logger_write("WARN", "keep-alive: connection lost");
+        g_netmgr.cleanup();
         g_connected.store(false);
         set_status("disconnected", "-");
     }
@@ -1334,7 +1515,7 @@ void worker_main() {
         Config cfg = get_config();
 
         if (!wait_for_internet(cfg)) {
-            if (g_stop.load()) return;
+            if (g_stop.load()) break;
             continue;
         }
 
@@ -1359,7 +1540,7 @@ void worker_main() {
 
         g_pass_running.store(false);
 
-        if (g_stop.load()) return;
+        if (g_stop.load()) break;
 
         if (success) {
             full_failures = 0;
@@ -1382,13 +1563,16 @@ void worker_main() {
                          std::to_string(cfg.pause_minutes) + " minutes");
             set_status("paused", "-");
             WaitReason r = wait_with_wake(cfg.pause_minutes * 60);
-            if (r == WaitReason::Stop) return;
+            if (r == WaitReason::Stop) break;
             if (r == WaitReason::Trigger) g_trigger.store(false);
             if (r == WaitReason::Reload) g_reload_wake.store(false);
             full_failures = 0;
             write_state(cfg.state_file, 0);
         }
     }
+
+    // Final cleanup on shutdown
+    g_netmgr.cleanup();
 }
 
 } // namespace
