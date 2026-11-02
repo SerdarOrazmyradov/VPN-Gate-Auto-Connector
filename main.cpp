@@ -495,6 +495,25 @@ bool curl_head(const std::string& url, int timeout_sec) {
     return code >= 200 && code < 400;
 }
 
+bool curl_get_ok(const std::string& url, int timeout_sec) {
+    CurlHandle h;
+    if (!h) return false;
+    curl_easy_setopt(h.get(), CURLOPT_URL, url.c_str());
+    curl_easy_setopt(h.get(), CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(h.get(), CURLOPT_TIMEOUT, (long)timeout_sec);
+    curl_easy_setopt(h.get(), CURLOPT_CONNECTTIMEOUT, (long)timeout_sec);
+    curl_easy_setopt(h.get(), CURLOPT_WRITEFUNCTION,
+                     +[](char*, size_t size, size_t count, void*) -> size_t {
+                         return size * count;
+                     });
+    curl_easy_setopt(h.get(), CURLOPT_USERAGENT, "vpnagent/1.0");
+    CURLcode rc = curl_easy_perform(h.get());
+    if (rc != CURLE_OK) return false;
+    long code = 0;
+    curl_easy_getinfo(h.get(), CURLINFO_RESPONSE_CODE, &code);
+    return code >= 200 && code < 400;
+}
+
 } // namespace
 
 // ============================================================
@@ -781,6 +800,53 @@ std::string extract_session_status(const std::string& output) {
     return "";
 }
 
+bool nic_list_contains(const std::string& output, const std::string& nic_name) {
+    std::istringstream iss(output);
+    std::string line;
+    while (std::getline(iss, line)) {
+        std::istringstream fields(line);
+        std::string field;
+        while (std::getline(fields, field, '|')) {
+            if (trim(field) == nic_name) return true;
+        }
+        if (trim(line) == nic_name) return true;
+    }
+    return false;
+}
+
+bool ensure_virtual_nic(const Config& cfg) {
+    auto list = run_vpncmd(cfg, {"NicList"});
+    if (list.timed_out || list.exit_code != 0 ||
+        list.output.find("Error occurred") != std::string::npos) {
+        logger_write("ERROR", "vpncmd NicList failed: " +
+                     first_meaningful_lines(list.output, 3));
+        return false;
+    }
+    if (nic_list_contains(list.output, cfg.nic_name)) {
+        logger_write("INFO", "vpn: virtual adapter " + cfg.nic_name + " already exists");
+        return true;
+    }
+
+    auto create = run_vpncmd(cfg, {"NicCreate", cfg.nic_name});
+    if (create.timed_out || create.exit_code != 0 ||
+        create.output.find("Error occurred") != std::string::npos) {
+        logger_write("ERROR", "vpncmd NicCreate failed for " + cfg.nic_name + ": " +
+                     first_meaningful_lines(create.output, 3));
+        return false;
+    }
+
+    list = run_vpncmd(cfg, {"NicList"});
+    if (list.timed_out || list.exit_code != 0 ||
+        list.output.find("Error occurred") != std::string::npos ||
+        !nic_list_contains(list.output, cfg.nic_name)) {
+        logger_write("ERROR", "vpn: virtual adapter " + cfg.nic_name +
+                     " was not present after NicCreate");
+        return false;
+    }
+    logger_write("INFO", "vpn: created virtual adapter " + cfg.nic_name);
+    return true;
+}
+
 } // namespace
 
 // ============================================================
@@ -955,7 +1021,7 @@ public:
             return false;
         }
 
-        // 6. install default route via VPN, delete any dhclient-provided defaults via iface
+        // 6. install or replace the VPN default route
         if (cfg.manage_routes) {
             if (!install_vpn_default(cfg)) {
                 return false;
@@ -963,8 +1029,8 @@ public:
         }
 
         // 7. DNS (optional)
-        if (cfg.manage_dns) {
-            setup_dns(cfg);
+        if (cfg.manage_dns && !setup_dns(cfg)) {
+            return false;
         }
 
         active_ = true;
@@ -1109,20 +1175,15 @@ private:
             vpn_gw_ = dhcp_default.gw; // may be empty for p2p TAP
         }
 
-        // Drop any default routes dhclient installed on this iface so we own them
-        {
-            auto r = run_cmd({"ip", "route", "flush", "default", "dev", iface_}, 10);
-            (void)r;
-        }
-
-        std::vector<std::string> add = {"ip", "route", "add", "default"};
+        std::vector<std::string> replace = {"ip", "route", "replace", "default"};
         if (!vpn_gw_.empty()) {
-            add.push_back("via");   add.push_back(vpn_gw_);
+            replace.push_back("via"); replace.push_back(vpn_gw_);
         }
-        add.push_back("dev");       add.push_back(iface_);
-        add.push_back("metric");    add.push_back(std::to_string(cfg.vpn_default_metric));
+        replace.push_back("dev"); replace.push_back(iface_);
+        replace.push_back("metric");
+        replace.push_back(std::to_string(cfg.vpn_default_metric));
 
-        auto r = run_cmd(add, 10);
+        auto r = run_cmd(replace, 10);
         if (r.exit_code != 0) {
             logger_write("ERROR", "net: failed to install VPN default route: " +
                          first_meaningful_lines(r.output, 2));
@@ -1134,71 +1195,134 @@ private:
         return true;
     }
 
-    void setup_dns(const Config& cfg) {
+    bool setup_dns(const Config& cfg) {
         const std::string resolv = "/etc/resolv.conf";
         struct stat lst;
-        if (lstat(resolv.c_str(), &lst) != 0) return;
-        if (S_ISLNK(lst.st_mode)) {
-            logger_write("WARN", "net: /etc/resolv.conf is a symlink "
-                                 "(likely systemd-resolved); skipping DNS management");
-            return;
+        if (lstat(resolv.c_str(), &lst) != 0) {
+            logger_write("ERROR", "net: cannot inspect /etc/resolv.conf: " +
+                         std::string(std::strerror(errno)));
+            return false;
         }
 
+        dns_was_symlink_ = S_ISLNK(lst.st_mode);
         std::string current;
-        {
-            std::ifstream f(resolv);
-            if (f) {
-                std::stringstream ss; ss << f.rdbuf();
-                current = ss.str();
+        if (dns_was_symlink_) {
+            char target[4096];
+            ssize_t len = readlink(resolv.c_str(), target, sizeof(target));
+            if (len < 0) {
+                logger_write("ERROR", "net: cannot read /etc/resolv.conf symlink: " +
+                             std::string(std::strerror(errno)));
+                dns_was_symlink_ = false;
+                return false;
             }
+            if ((size_t)len == sizeof(target)) {
+                logger_write("ERROR", "net: /etc/resolv.conf symlink target is too long");
+                dns_was_symlink_ = false;
+                return false;
+            }
+            dns_original_symlink_target_.assign(target, (size_t)len);
+        } else {
+            std::ifstream f(resolv);
+            if (!f) {
+                logger_write("ERROR", "net: cannot read /etc/resolv.conf");
+                return false;
+            }
+            std::stringstream ss;
+            ss << f.rdbuf();
+            current = ss.str();
         }
 
         if (!dns_backed_up_) {
-            dns_backup_ = "/etc/resolv.conf.vpnagent.bak";
-            std::ofstream b(dns_backup_, std::ios::trunc);
-            if (b) { b << current; b.flush(); dns_backed_up_ = true; }
+            if (dns_was_symlink_) {
+                dns_backed_up_ = true;
+            } else {
+                dns_backup_ = "/etc/resolv.conf.vpnagent.bak";
+                std::ofstream b(dns_backup_, std::ios::trunc);
+                if (!b) {
+                    logger_write("ERROR", "net: cannot back up /etc/resolv.conf");
+                    dns_backup_.clear();
+                    return false;
+                }
+                b << current;
+                b.flush();
+                if (!b) {
+                    logger_write("ERROR", "net: failed to back up /etc/resolv.conf");
+                    unlink(dns_backup_.c_str());
+                    dns_backup_.clear();
+                    return false;
+                }
+                dns_backed_up_ = true;
+            }
         }
 
-        // Write nameserver lines followed by the original content (so user
-        // specific settings aren't lost, but our nameservers take precedence).
+        if (dns_was_symlink_ && unlink(resolv.c_str()) != 0) {
+            logger_write("ERROR", "net: cannot unlink /etc/resolv.conf symlink: " +
+                         std::string(std::strerror(errno)));
+            return false;
+        }
+        dns_modified_ = true;
+
         std::ofstream f(resolv, std::ios::trunc);
         if (!f) {
-            logger_write("WARN", "net: cannot write /etc/resolv.conf");
-            return;
+            logger_write("ERROR", "net: cannot write /etc/resolv.conf");
+            return false;
         }
         std::istringstream ss(cfg.dns_servers);
         std::string ns;
         while (ss >> ns) {
             f << "nameserver " << ns << "\n";
         }
-        f << current;
+        if (!dns_was_symlink_) f << current;
         f.flush();
-        dns_modified_ = true;
+        if (!f) {
+            logger_write("ERROR", "net: failed writing /etc/resolv.conf");
+            return false;
+        }
         logger_write("INFO", "net: DNS configured with: " + cfg.dns_servers);
+        return true;
     }
 
     void restore_dns() {
         if (!dns_modified_) return;
         const std::string resolv = "/etc/resolv.conf";
-        const std::string bak = dns_backup_.empty()
-            ? std::string("/etc/resolv.conf.vpnagent.bak")
-            : dns_backup_;
-        if (file_exists(bak)) {
-            // Copy contents back (avoid rename in case of bind mounts)
+        if (dns_was_symlink_) {
+            if (unlink(resolv.c_str()) != 0 && errno != ENOENT) {
+                logger_write("ERROR", "net: cannot remove managed /etc/resolv.conf: " +
+                             std::string(std::strerror(errno)));
+                return;
+            }
+            if (symlink(dns_original_symlink_target_.c_str(), resolv.c_str()) != 0) {
+                logger_write("ERROR", "net: cannot restore /etc/resolv.conf symlink: " +
+                             std::string(std::strerror(errno)));
+                return;
+            }
+            logger_write("INFO", "net: /etc/resolv.conf symlink restored");
+        } else {
+            const std::string bak = dns_backup_;
             std::ifstream in(bak);
+            if (!in) {
+                logger_write("ERROR", "net: cannot read /etc/resolv.conf backup");
+                return;
+            }
             std::ofstream out(resolv, std::ios::trunc);
-            if (in && out) {
-                out << in.rdbuf();
-                out.flush();
-                logger_write("INFO", "net: /etc/resolv.conf restored");
-            } else {
-                logger_write("WARN", "net: failed to restore /etc/resolv.conf");
+            if (!out) {
+                logger_write("ERROR", "net: cannot restore /etc/resolv.conf");
+                return;
+            }
+            out << in.rdbuf();
+            out.flush();
+            if (!out) {
+                logger_write("ERROR", "net: failed to restore /etc/resolv.conf");
+                return;
             }
             unlink(bak.c_str());
+            logger_write("INFO", "net: /etc/resolv.conf restored");
         }
         dns_modified_ = false;
         dns_backed_up_ = false;
         dns_backup_.clear();
+        dns_was_symlink_ = false;
+        dns_original_symlink_target_.clear();
     }
 
     bool active_ = false;
@@ -1216,7 +1340,9 @@ private:
 
     bool dns_modified_ = false;
     bool dns_backed_up_ = false;
+    bool dns_was_symlink_ = false;
     std::string dns_backup_;
+    std::string dns_original_symlink_target_;
 };
 
 // Single global instance (only touched by worker thread and its children).
@@ -1318,6 +1444,14 @@ ServerResult try_server(const Config& cfg, const ServerEntry& srv, int index) {
                     g_netmgr.cleanup();
                     run_vpncmd(cfg, {"AccountDisconnect", cfg.account_name});
                     log_attempt(index, server_str, "network-failed", t0, "");
+                    return ServerResult::SetFailed;
+                }
+                if (!curl_get_ok("https://connectivitycheck.gstatic.com/generate_204", 4)) {
+                    logger_write("WARN", "net: no-egress-traffic for " + server_str +
+                                 "; rolling back and trying next server");
+                    g_netmgr.cleanup();
+                    run_vpncmd(cfg, {"AccountDisconnect", cfg.account_name});
+                    log_attempt(index, server_str, "no-egress-traffic", t0, "");
                     return ServerResult::SetFailed;
                 }
                 log_attempt(index, server_str, "success", t0, "");
@@ -1832,6 +1966,13 @@ int daemon_main() {
     if (pid_fd == -2) return 1;
     if (pid_fd < 0) {
         std::fprintf(stderr, "cannot lock pid file\n");
+        return 1;
+    }
+
+    if (!ensure_virtual_nic(cfg)) {
+        std::fprintf(stderr, "cannot ensure SoftEther virtual adapter: %s\n",
+                     cfg.nic_name.c_str());
+        close(pid_fd);
         return 1;
     }
 
